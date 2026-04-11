@@ -1,0 +1,15 @@
+# Local development files (not deployed to HF Spaces)
+CLAUDE.md
+.claude/
+__pycache__/
+*.pyc
+_points.txt
+
+# JEPX source CSVs (jepx.db is generated from these — see build_jepx_db.py)
+spot_summary_*.csv
+build_jepx_db.py
+
+# Test scripts and outputs
+test_*.py
+test_*.txt
+test_meti.txt
