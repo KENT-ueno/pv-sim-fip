@@ -13,3 +13,6 @@ build_jepx_db.py
 test_*.py
 test_*.txt
 test_meti.txt
+
+# Verification / debug prompts (developer notes)
+prompt_*.md
