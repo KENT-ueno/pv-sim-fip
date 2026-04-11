@@ -103,7 +103,7 @@ JEPX_FISCAL_YEARS = [2020, 2021, 2022, 2023, 2024, 2025]
 JEPX_FISCAL_YEARS_DEFAULT = [2023, 2024, 2025]
 
 # === FIP設定 ===
-DEFAULT_FIP_PREMIUM = 8.0      # FIPプレミアム [円/kWh]（暫定。基準価格−参照価格）
+DEFAULT_FIP_PREMIUM = 9.6      # FIPプレミアム [円/kWh]（基準価格−参照価格）
 DEFAULT_NONFOSSIL_PRICE = 0.6  # 非化石証書単価 [円/kWh]
 DEFAULT_BG_FEE = 2.0           # BG手数料 [円/kWh]
 
