@@ -1083,8 +1083,10 @@ def build_cashflow(
     # === O&M ===
     # PV分は常にCAPEX比（om_ratio_pct）
     pv_annual_om = pv_capex * (om_ratio_pct / 100.0)
-    # 蓄電池分はモードに依存
-    if bat_om_mode == "PCS_kW建て（三菱総研試算）":
+    # 蓄電池分はモードに依存（蓄電池なし=bat_capex=0 の場合はゼロ）
+    if bat_capex <= 0:
+        bat_annual_om = 0.0
+    elif bat_om_mode == "PCS_kW建て（三菱総研試算）":
         bat_annual_om = bat_max_charge_kw * om_bat_per_kw_pcs
     else:
         # CAPEX比モード（従来動作）
@@ -1319,6 +1321,7 @@ def build_caseb_display_rows(
 
     # --- Plant year 0: PV 初期投資 ---
     cum = -pv_acquisition_cost
+    cum_net = -pv_acquisition_cost  # 借入返済後の累計（project累計とは別に積算）
     rows.append({
         "year": 0,
         "revenue": 0.0,
@@ -1331,7 +1334,7 @@ def build_caseb_display_rows(
         "net_cf": -pv_acquisition_cost,
         "project_cf": -pv_acquisition_cost,
         "cum_project": cum,
-        "cum_net": cum,
+        "cum_net": cum_net,
     })
 
     # --- Plant year 1..(fip_transition_year - 1): FIT phase ---
@@ -1339,6 +1342,7 @@ def build_caseb_display_rows(
         rev = annual_gen_kwh * float(fit_tariff)
         ebitda = rev - pv_om
         cum += ebitda
+        cum_net += ebitda
         rows.append({
             "year": py,
             "revenue": rev,
@@ -1351,7 +1355,7 @@ def build_caseb_display_rows(
             "net_cf": ebitda,
             "project_cf": ebitda,
             "cum_project": cum,
-            "cum_net": cum,
+            "cum_net": cum_net,
         })
 
     # --- Plant year fip_transition_year: 蓄電池投資 + 最初のFIP+蓄電池運営年 ---
@@ -1368,6 +1372,7 @@ def build_caseb_display_rows(
         project_cf_total = -bat_net_capex + project_cf_op1
         net_cf_total = project_cf_total - debt1
         cum += project_cf_total
+        cum_net += net_cf_total
         rows.append({
             "year": int(fip_transition_year),
             "revenue": rev1,
@@ -1380,7 +1385,7 @@ def build_caseb_display_rows(
             "net_cf": net_cf_total,
             "project_cf": project_cf_total,
             "cum_project": cum,
-            "cum_net": cum,
+            "cum_net": cum_net,
         })
 
     # --- Plant year (fip_transition_year+1)..: FIP+蓄電池の残り運営年 ---
@@ -1396,6 +1401,7 @@ def build_caseb_display_rows(
         project_cf = ebitda - bat_repl - decom
         net_cf = project_cf - debt
         cum += project_cf
+        cum_net += net_cf
         rows.append({
             "year": py,
             "revenue": rev,
@@ -1408,7 +1414,7 @@ def build_caseb_display_rows(
             "net_cf": net_cf,
             "project_cf": project_cf,
             "cum_project": cum,
-            "cum_net": cum,
+            "cum_net": cum_net,
         })
 
     return rows
@@ -2315,7 +2321,7 @@ def run_simulation(
             result_text += f"蓄電池容量（最適探索）: {used_capacity:.0f} kWh\n"
             if capacity_search_result:
                 result_text += f"  段階1（LP一体化）: {capacity_search_result['stage1_capacity']:.0f} kWh\n"
-                result_text += f"  段階2（P-IRR最大）: {capacity_search_result['best_capacity']:.0f} kWh\n"
+                result_text += f"  段階2（NPV最大）: {capacity_search_result['best_capacity']:.0f} kWh\n"
         else:
             result_text += f"蓄電池容量（手動入力）: {used_capacity:.0f} kWh\n"
         result_text += f"年間充電量: {opt_result['annual_charge']:.0f} kWh/年\n"
