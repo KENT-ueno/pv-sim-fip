@@ -399,7 +399,10 @@ def compute_poa_30min(ghi_30min, lat, lon, surface_tilt, surface_azimuth,
         start="2023-01-01 00:00", periods=total_slots, freq="30min", tz="Asia/Tokyo"
     )
 
-    ghi_flat = ghi_30min.flatten() * 2.0 * 1000.0
+    # ghi_30min は「30分平均 kW/m²」（毎時kWh/m²を大きさ保存で補間したもの）。
+    # W/m² 実強度への変換は ×1000 のみ。×2000 にすると晴天指数ktが2倍で評価され、
+    # Erbs分離のDNIが過大 → POAが5〜8%過大になる（pv-sim-biz バグ1と同型）。
+    ghi_flat = ghi_30min.flatten() * 1000.0
     ghi_series = pd.Series(ghi_flat, index=times)
 
     site = pvlib.location.Location(lat, lon, tz="Asia/Tokyo")
@@ -443,8 +446,9 @@ def compute_poa_30min(ghi_30min, lat, lon, surface_tilt, surface_azimuth,
         )
         poa_global = poa_components["poa_global"].fillna(0).clip(lower=0)
 
-    poa_kwh = poa_global.values / 1000.0 / 2.0
-    poa_30min = poa_kwh.reshape(n_days, 48)
+    # 出力も入力と同じ「30分平均 kW/m²」に戻す（W/m² → kW/m² は /1000 のみ）
+    poa_kw = poa_global.values / 1000.0
+    poa_30min = poa_kw.reshape(n_days, 48)
 
     return poa_30min
 
@@ -2251,7 +2255,8 @@ def run_simulation(
         fig_monthly = make_monthly_chart(result, opt_result, baseline)
         fig_daily = make_daily_chart(
             result, opt_result, jepx_prices,
-            int(display_month), int(display_day),
+            int(display_month) if display_month is not None else 7,
+            int(display_day) if display_day is not None else 15,
         )
         # ケースB は CF チャートをプラント運転年ベースで表示（オーナー視点）
         # IRR/NPV/payback は増分CFで計算済み（cf_result に格納済み）→ そのまま流用
@@ -2849,6 +2854,9 @@ def build_ui():
                 fig = go.Figure()
                 fig.update_layout(title="先に「計算実行」ボタンを押してください")
                 return fig
+            # Number入力が空欄（None）のときはデフォルト日付にフォールバック
+            month_val = month_val if month_val is not None else 7
+            day_val = day_val if day_val is not None else 15
             return make_daily_chart(
                 stored_state["result"],
                 stored_state["opt_result"],
