@@ -196,7 +196,7 @@ Claude (エージェント) ┼─ (MCP) ─ pv-sim-gh    … 家庭用需給
 
 | Phase | 内容 | 完了条件 |
 |---|---|---|
-| **4a** | fip MCP化最小版: Gradio更新、`list_stations` / `get_jepx_stats` / `validate_fip_params` / `simulate_fip_case_a/b` | Claude Codeから接続し、ケースA試算のE2E成功。既存UIの回帰なし（smoke/MRIテスト通過） |
+| **4a** ✅ | fip MCP化最小版: Gradio更新、`list_stations` / `get_jepx_stats` / `estimate_pv_generation` / `validate_fip_params` / `simulate_fip_case_a/b` | **完了（2026-08-31, commit f1d9bf4）**。本番Spaceで全6ツール動作確認（IRR 7.11%=ローカル一致）。UI回帰なし |
 | **4b** | ガードレール整備: 出力スキーマ統一、caveats同梱、`arbitrage_realization_rate`（UI側にも追加）、入力上限 | validate→confirm→simulateの運用が実プロンプトで機能 |
 | **4c** | 系統用蓄電池: 制度調査（託送・容量市場）→ LP実装 → `simulate_grid_battery` | ミニケースLP検証＋公表試算との突合 |
 | **4d** | 横展開: gh / biz を同パターンでMCP化（各リポジトリで実施） | 3サーバー同時接続で横断比較が動く |
@@ -208,6 +208,21 @@ Claude (エージェント) ┼─ (MCP) ─ pv-sim-gh    … 家庭用需給
 - `test_mcp_tools.py`: 各ツールの正常系/異常系/JSON構造/入力上限
 - 既存 `test_phase3_smoke.py` / `test_mri_slide47.py` の回帰維持（MCP化がUI経路を壊さないこと）
 - E2E: Claude Codeから実際にMCP接続して代表シナリオ3件（ケースA/B/系統用）
+
+### Phase 4a 実装時の重要な学び（4dの横展開で必ず適用すること）
+
+**`import app` を関数内で行ってはいけない。** HF Spaces / `python app.py` 起動では
+appモジュールが `"__main__"` 名でロードされるため、リクエスト処理中に `import app` すると
+**app.py がゼロから二重実行され、ワーカースレッド内で `build_ui()` が走ってGradioがクラッシュ**する
+（`AttributeError: 'Radio' object has no attribute '_id'`、UIは正常なのにAPI/MCPだけ
+`event: error` を返す形で顕在化）。`mcp_tools._get_app()` のように
+`sys.modules` からロード済みモジュール（`app` または `__main__`）を探して再利用する。
+
+**UIイベントは `api_visibility="hidden"` で隠す。** 指定しないと `on_click` や
+`update_face_visibility` までMCPツールとして公開され、エージェントが誤って呼ぶ余地が生まれる。
+
+**検証はHTTP経路で行う。** 関数を直接呼ぶユニットテストだけでは上記の二重import問題を
+検出できない。`python app.py` を起動して `/gradio_api/call/<name>` を叩く経路が本番と同一。
 
 ---
 
