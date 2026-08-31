@@ -4,7 +4,7 @@ emoji: 🔋
 colorFrom: green
 colorTo: blue
 sdk: gradio
-sdk_version: 5.23.0
+sdk_version: 6.26.0
 app_file: app.py
 pinned: false
 license: mit
@@ -15,7 +15,7 @@ license: mit
 [![Hugging Face Space](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-yellow)](https://huggingface.co/spaces/hachinai/pv-sim-fip)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
-[![Gradio](https://img.shields.io/badge/Gradio-5.23-orange)](https://gradio.app/)
+[![Gradio](https://img.shields.io/badge/Gradio-6.26-orange)](https://gradio.app/)
 
 A web-based simulator for **utility-scale Solar PV + battery storage business cases under Japan's FIP (Feed-in Premium) scheme**. Built on JIS C 8907 generation modeling, NEDO METPV-20 weather data for 77 Japanese sites, JEPX spot-market price database (9 areas × 6 fiscal years), and PuLP/CBC linear programming for optimal 30-minute battery dispatch over 17,520 timeslots per year.
 

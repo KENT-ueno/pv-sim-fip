@@ -1424,6 +1424,49 @@ def build_caseb_display_rows(
     return rows
 
 
+def apply_caseb_incremental_metrics(cf_result, fit_continuation_cf, loan_interest_pct):
+    """ケースB: 増分CF「FIP転+蓄電池 − FIT継続」でIRR/NPV/回収年数を再計算しcf_resultを更新する。
+
+    前提:
+      - cf_result は pv_capex=0 で構築済み（project_cf = FIP収益 − 蓄電池O&M − 交換 − 廃止措置）
+      - PV O&M は両シナリオで同額発生し相殺されるため、FIT継続側は「収益のみ」控除する
+    副作用:
+      - cf_result["rows"] 各行に incremental_project_cf を追加
+      - cf_result の project_irr / project_npv / payback_year を増分CFベースで上書き
+    Returns:
+      incremental_project_cfs: list[float]
+    """
+    incremental_project_cfs = []
+    for y_idx, row in enumerate(cf_result["rows"]):
+        if y_idx == 0:
+            # Year 0: 投資額（蓄電池のみ、補助後）
+            incremental_project_cfs.append(row["project_cf"])
+        else:
+            fit_row = fit_continuation_cf["rows"][y_idx]
+            # FIT継続の「収益のみ」を控除（PV O&M は相殺するため控除しない）
+            inc_pcf = row["project_cf"] - fit_row["revenue"]
+            incremental_project_cfs.append(inc_pcf)
+        # 行に増分CFを保存（グラフ/結果表示用）
+        row["incremental_project_cf"] = incremental_project_cfs[y_idx]
+
+    # IRR/NPV/payback を増分CFで再計算
+    cf_result["project_irr"] = calc_irr(incremental_project_cfs)
+    cf_result["project_npv"] = calc_npv(incremental_project_cfs, float(loan_interest_pct))
+    # payback: 増分project_cfの累計 >= 0 となる最初の年
+    cum_inc = 0.0
+    payback_inc = None
+    for y_idx, pcf in enumerate(incremental_project_cfs):
+        if y_idx == 0:
+            cum_inc = pcf
+            continue
+        cum_inc += pcf
+        if cum_inc >= 0:
+            payback_inc = y_idx
+            break
+    cf_result["payback_year"] = payback_inc
+    return incremental_project_cfs
+
+
 def grid_search_capacity_pirr(
     base_capacity_kwh, n_steps,
     generation_30min, jepx_prices, month_day,
@@ -2215,41 +2258,10 @@ def run_simulation(
             )
 
             # === 増分CFに基づくProject IRR/NPV/回収年数の再計算 ===
-            # Scenario A (FIT継続): 年間CF = fit_rev - pv_om_sunk
-            # Scenario B (FIP転+bat): 年間CF = FIP_bat_rev - pv_om_sunk - bat_om - bat_replace - decom
-            # 増分 = B - A = (FIP_bat_rev - fit_rev) - bat_om - bat_replace - decom  （pv_om相殺）
-            # cf_result.rows は pv_capex=0 で計算済なので project_cf = FIP_bat_rev - bat_om - bat_replace - decom
-            # したがって incremental_project_cf[y] = cf_result.project_cf[y] - fit_continuation_revenue[y]
-            incremental_project_cfs = []
-            for y_idx, row in enumerate(cf_result["rows"]):
-                if y_idx == 0:
-                    # Year 0: 投資額（蓄電池のみ、補助後）
-                    incremental_project_cfs.append(row["project_cf"])
-                else:
-                    fit_row = fit_continuation_cf["rows"][y_idx]
-                    # FIT継続の「収益のみ」を控除（PV O&M は相殺するため控除しない）
-                    inc_pcf = row["project_cf"] - fit_row["revenue"]
-                    incremental_project_cfs.append(inc_pcf)
-                # 行に増分CFを保存（グラフ/結果表示用）
-                row["incremental_project_cf"] = incremental_project_cfs[y_idx]
-
-            # IRR/NPV/payback を増分CFで再計算
-            cf_result["project_irr"] = calc_irr(incremental_project_cfs)
-            cf_result["project_npv"] = calc_npv(
-                incremental_project_cfs, float(loan_interest_pct)
+            # （ロジック本体は apply_caseb_incremental_metrics に集約。MCPツールと共有）
+            apply_caseb_incremental_metrics(
+                cf_result, fit_continuation_cf, float(loan_interest_pct)
             )
-            # payback: 増分project_cfの累計 >= 0 となる最初の年
-            cum_inc = 0.0
-            payback_inc = None
-            for y_idx, pcf in enumerate(incremental_project_cfs):
-                if y_idx == 0:
-                    cum_inc = pcf
-                    continue
-                cum_inc += pcf
-                if cum_inc >= 0:
-                    payback_inc = y_idx
-                    break
-            cf_result["payback_year"] = payback_inc
 
         # --- グラフ生成 ---
         fig_monthly = make_monthly_chart(result, opt_result, baseline)
@@ -2520,6 +2532,7 @@ def build_ui():
 
                 case_type_input.change(
                     fn=toggle_case_b, inputs=[case_type_input], outputs=[case_b_group],
+                    api_visibility="hidden",
                 )
 
                 # --- FIP設定 ---
@@ -2754,6 +2767,7 @@ def build_ui():
                     fn=update_face_visibility,
                     inputs=[num_faces_input],
                     outputs=face_groups,
+                    api_visibility="hidden",
                 )
 
                 run_btn = gr.Button("▶️ 計算実行（LP最適化のため数十秒かかります）", variant="primary", size="lg")
@@ -2846,6 +2860,7 @@ def build_ui():
             fn=on_click,
             inputs=all_inputs_with_display,
             outputs=[monthly_plot, daily_plot, cashflow_plot, capacity_plot, result_box, debug_box, result_state],
+            api_visibility="hidden",
         )
 
         # === 月日変更時のグラフ再描画（再計算なし） ===
@@ -2868,12 +2883,26 @@ def build_ui():
             fn=on_date_change,
             inputs=[result_state, month_input, day_input],
             outputs=[daily_plot],
+            api_visibility="hidden",
         )
         day_input.change(
             fn=on_date_change,
             inputs=[result_state, month_input, day_input],
             outputs=[daily_plot],
+            api_visibility="hidden",
         )
+
+        # === MCP APIエンドポイント（Phase 4a、docs/agent_design.md） ===
+        # gr.api() でUI無しのAPI関数を登録。mcp_server=True 時にMCPツールとして公開される。
+        # ここで遅延importすることで app ⇄ mcp_tools の循環importを回避
+        # （この時点で app モジュールの全関数定義が完了しているため安全）。
+        import mcp_tools
+        gr.api(mcp_tools.list_stations, api_name="list_stations")
+        gr.api(mcp_tools.get_jepx_stats, api_name="get_jepx_stats")
+        gr.api(mcp_tools.estimate_pv_generation, api_name="estimate_pv_generation")
+        gr.api(mcp_tools.validate_fip_params, api_name="validate_fip_params")
+        gr.api(mcp_tools.simulate_fip_case_a, api_name="simulate_fip_case_a")
+        gr.api(mcp_tools.simulate_fip_case_b, api_name="simulate_fip_case_b")
 
     return demo
 
@@ -2885,4 +2914,5 @@ def build_ui():
 demo = build_ui()
 
 if __name__ == "__main__":
-    demo.launch()
+    # mcp_server=True: /gradio_api/mcp/ でMCPサーバーを公開（Phase 4a）
+    demo.launch(mcp_server=True)
