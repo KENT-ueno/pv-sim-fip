@@ -16,10 +16,23 @@ import sqlite3
 
 import numpy as np
 
-# NOTE: 計算ロジック本体（app.py）は各関数内で遅延importする。
-# app.py は build_ui() 内で本モジュールを import するため、モジュールレベルで
-# `import app` すると「mcp_tools を先に import した場合」に循環importで失敗する。
-# 関数呼び出し時には両モジュールとも初期化完了しているため、関数内importは常に安全。
+# NOTE: 計算ロジック本体（app.py）は _get_app() で遅延解決する。
+# - モジュールレベルで `import app` すると「mcp_tools を先に import した場合」に循環importで失敗する
+# - `python app.py` で起動した場合（HF Spaces含む）、appは "__main__" 名でロードされるため、
+#   関数内で素朴に `import app` すると app.py が二重実行され、リクエストスレッド内で
+#   build_ui() が走って Gradio がクラッシュする（'Radio' object has no attribute '_id'）
+# 既にロード済みのモジュール（app または __main__）を探して再利用するのが唯一安全な方法。
+
+
+def _get_app():
+    """計算ロジック本体（app.pyモジュール）を返す。二重import・二重build_uiを防ぐ。"""
+    import sys
+    for name in ("app", "__main__"):
+        mod = sys.modules.get(name)
+        if mod is not None and hasattr(mod, "optimize_battery_fip"):
+            return mod
+    import app
+    return app
 
 # ============================================================
 # 定数
@@ -49,7 +62,7 @@ _COMMON_CAVEATS = [
 
 def _resolve_station(station_no: str):
     """地点番号から (lat, lon, ghi_df, temp_df, station_name) を返す。"""
-    import app
+    app = _get_app()
     conn = sqlite3.connect(app.DB_PATH)
     row = conn.execute(
         "SELECT point_name FROM points WHERE point_no = ?", (str(station_no),)
@@ -105,7 +118,7 @@ def _normalize_and_validate(
     pv_acquisition_cost_yen: float,
 ):
     """パラメータを正規化し (params, warnings, errors) を返す。LPは実行しない。"""
-    import app
+    app = _get_app()
     errors = []
     warnings = []
 
@@ -249,7 +262,7 @@ def _zero_battery_opt_result(baseline, gen_shape):
 
 def _run_fip_simulation(case: str, p: dict):
     """検証済みパラメータ p で ケースA/B のシミュレーションを実行し、構造化dictを返す。"""
-    import app
+    app = _get_app()
     lat, lon, ghi_df, temp_df, _ = _resolve_station(p["station_no"])
 
     faces = [{
@@ -428,7 +441,7 @@ def list_stations() -> dict:
     Returns:
         dict: {"stations": [{"station_no", "name", "latitude", "longitude"}, ...]}
     """
-    import app
+    app = _get_app()
     conn = sqlite3.connect(app.DB_PATH)
     rows = conn.execute(
         "SELECT point_no, point_name, lat, lon FROM points ORDER BY point_no"
@@ -457,7 +470,7 @@ def get_jepx_stats(area: str = "東京", fiscal_years: list[int] = [2023, 2024, 
     Returns:
         dict: 価格統計（円/kWh）。slot_avg_yen_per_kwh は48コマ（30分刻み）の平均価格
     """
-    import app
+    app = _get_app()
     if area not in app.JEPX_AREAS:
         return {"error": f"area は {app.JEPX_AREAS} から選択してください"}
     years = [int(y) for y in (fiscal_years or [])]
@@ -526,7 +539,7 @@ def estimate_pv_generation(
     Returns:
         dict: 年間発電量・月別発電量・設備利用率
     """
-    import app
+    app = _get_app()
     try:
         if not (0 < ppeak_kw <= MAX_PPEAK_KW):
             return {"error": f"ppeak_kw は 0 < x <= {MAX_PPEAK_KW:.0f}"}
