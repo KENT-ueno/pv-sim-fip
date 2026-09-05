@@ -103,7 +103,10 @@ JEPX_FISCAL_YEARS = [2020, 2021, 2022, 2023, 2024, 2025]
 JEPX_FISCAL_YEARS_DEFAULT = [2023, 2024, 2025]
 
 # === FIP設定 ===
-DEFAULT_FIP_PREMIUM = 9.6      # FIPプレミアム [円/kWh]（基準価格−参照価格）
+DEFAULT_FIP_BASE_PRICE = 9.6   # FIP基準価格 [円/kWh]（METI公表値。50kW以上・地上設置、2026年度想定）
+# 参照価格は選択年度のJEPX単純平均から自動算定し、
+#   実効プレミアム = 基準価格 − 参照価格
+# を売電単価に加算する。ユーザーが「上乗せ額」ではなく「基準価格」を直接入力できるようにするため。
 DEFAULT_NONFOSSIL_PRICE = 0.6  # 非化石証書単価 [円/kWh]
 DEFAULT_BG_FEE = 2.0           # BG手数料 [円/kWh]
 
@@ -1943,7 +1946,7 @@ def run_simulation(
     bat_soc_min, bat_soc_max,
     bat_degrade_pct, bat_life_years, bat_eol_action, bat_replace_cost_ratio,
     jepx_area, jepx_years,
-    fip_premium, nonfossil_price, bg_fee,
+    fip_base_price, nonfossil_price, bg_fee,
     annual_curtail_rate_pct,
     pv_cost_per_kw, bat_cost_per_kwh,
     subsidy_pv_pct, subsidy_bat_pct,
@@ -2033,6 +2036,14 @@ def run_simulation(
         years_int = [int(y) for y in jepx_years]
         jepx_prices = load_jepx_prices(jepx_area, years_int, result["month_day"])
 
+        # --- FIP実効プレミアムの算定 ---
+        # 参照価格 = 選択エリア・年度のJEPX単純平均（公表される参照価格の簡易近似）。
+        # 実効プレミアム = 基準価格 − 参照価格。ユーザーは公表済みの「基準価格」を
+        # そのまま入力し、市場への上乗せ額はここで自動計算する
+        # （基準価格をそのままプレミアムとして加算する誤りを構造的に防ぐ）。
+        reference_price = float(np.mean(jepx_prices))
+        fip_premium_effective = float(fip_base_price) - reference_price
+
         # --- 出力制御プロファイル（エネルギー重み付け） ---
         curtail_prob = build_curtail_prob_30min(
             result["month_day"], float(annual_curtail_rate_pct),
@@ -2042,7 +2053,7 @@ def run_simulation(
         # --- ベースライン: 蓄電池なし（出力制御適用） ---
         baseline = baseline_no_battery(
             result["total_gen_clipped"], jepx_prices, result["month_day"],
-            premium=float(fip_premium),
+            premium=fip_premium_effective,
             nonfossil_price=float(nonfossil_price),
             bg_fee=float(bg_fee),
             curtail_prob=curtail_prob,
@@ -2060,7 +2071,7 @@ def run_simulation(
 
         # プレミアム終了後の「蓄電池なし」収益（LP schedule は premium に依存しないので減算のみ）
         baseline_no_prem_rev = (
-            baseline["annual_revenue"] - baseline["annual_export"] * float(fip_premium)
+            baseline["annual_revenue"] - baseline["annual_export"] * fip_premium_effective
         )
 
         # --- 蓄電池容量決定: 手動 or 最適容量探索 ---
@@ -2077,7 +2088,7 @@ def run_simulation(
                 eff_discharge_pct=float(bat_eff_discharge),
                 soc_min_pct=float(bat_soc_min),
                 soc_max_pct=float(bat_soc_max),
-                premium=float(fip_premium),
+                premium=fip_premium_effective,
                 nonfossil_price=float(nonfossil_price),
                 bg_fee=float(bg_fee),
                 bat_cost_per_kwh_net=float(bat_cost_per_kwh) * (1 - float(subsidy_bat_pct) / 100.0),
@@ -2112,7 +2123,7 @@ def run_simulation(
                 eff_discharge_pct=float(bat_eff_discharge),
                 soc_min_pct=float(bat_soc_min),
                 soc_max_pct=float(bat_soc_max),
-                premium=float(fip_premium),
+                premium=fip_premium_effective,
                 nonfossil_price=float(nonfossil_price),
                 bg_fee=float(bg_fee),
                 curtail_prob=curtail_prob,
@@ -2190,7 +2201,7 @@ def run_simulation(
                 eff_discharge_pct=float(bat_eff_discharge),
                 soc_min_pct=float(bat_soc_min),
                 soc_max_pct=float(bat_soc_max),
-                premium=float(fip_premium),
+                premium=fip_premium_effective,
                 nonfossil_price=float(nonfossil_price),
                 bg_fee=float(bg_fee),
                 curtail_prob=curtail_prob,
@@ -2212,7 +2223,7 @@ def run_simulation(
 
         # プレミアム終了後の「蓄電池あり」収益（LP schedule は premium に依存しない）
         opt_no_prem_rev = (
-            opt_result["annual_revenue"] - opt_result["annual_export"] * float(fip_premium)
+            opt_result["annual_revenue"] - opt_result["annual_export"] * fip_premium_effective
         )
 
         cf_result = build_cashflow(
@@ -2301,7 +2312,7 @@ def run_simulation(
 
         # --- 結果テキスト ---
         avg_jepx = float(np.mean(jepx_prices))
-        unit_avg = avg_jepx + float(fip_premium) + float(nonfossil_price) - float(bg_fee)
+        unit_avg = avg_jepx + fip_premium_effective + float(nonfossil_price) - float(bg_fee)
 
         result_text = "═══════════════════════════════════\n"
         result_text += " FIP転＋蓄電池 事業性シミュレーション\n"
@@ -2317,7 +2328,9 @@ def run_simulation(
         result_text += f"エリア: {jepx_area}\n"
         result_text += f"年度: {', '.join(str(y) for y in years_int)}（{len(years_int)}年度平均）\n"
         result_text += f"年平均価格: {avg_jepx:.2f} 円/kWh\n"
-        result_text += f"FIPプレミアム: {float(fip_premium):.2f} 円/kWh\n"
+        result_text += f"FIP基準価格: {float(fip_base_price):.2f} 円/kWh\n"
+        result_text += f"参照価格（算定、選択年度JEPX単純平均）: {reference_price:.2f} 円/kWh\n"
+        result_text += f"実効プレミアム（基準価格−参照価格）: {fip_premium_effective:+.2f} 円/kWh\n"
         result_text += f"非化石証書: {float(nonfossil_price):.2f} 円/kWh\n"
         result_text += f"BG手数料: -{float(bg_fee):.2f} 円/kWh\n"
         result_text += f"年平均売電単価: {unit_avg:.2f} 円/kWh\n\n"
@@ -2538,9 +2551,9 @@ def build_ui():
                 # --- FIP設定 ---
                 gr.Markdown("### 📋 FIP制度パラメータ")
                 with gr.Row():
-                    fip_premium_input = gr.Number(
-                        label="FIPプレミアム [円/kWh]",
-                        value=DEFAULT_FIP_PREMIUM, precision=2,
+                    fip_base_price_input = gr.Number(
+                        label="FIP基準価格 [円/kWh]（公表値をそのまま入力。参照価格は自動算定）",
+                        value=DEFAULT_FIP_BASE_PRICE, precision=2,
                     )
                     nonfossil_price_input = gr.Number(
                         label="非化石証書 [円/kWh]",
@@ -2809,7 +2822,7 @@ def build_ui():
             bat_soc_min_input, bat_soc_max_input,
             bat_degrade_input, bat_life_input, bat_eol_input, bat_replace_cost_input,
             jepx_area_input, jepx_years_input,
-            fip_premium_input, nonfossil_price_input, bg_fee_input,
+            fip_base_price_input, nonfossil_price_input, bg_fee_input,
             annual_curtail_input,
             pv_cost_input, bat_cost_input,
             subsidy_pv_input, subsidy_bat_input,

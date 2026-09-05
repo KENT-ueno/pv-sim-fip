@@ -96,7 +96,7 @@ def _normalize_and_validate(
     battery_replace_cost_ratio_pct: float,
     jepx_area: str,
     jepx_fiscal_years: list[int],
-    fip_premium_yen_per_kwh: float,
+    fip_base_price_yen_per_kwh: float,
     nonfossil_price_yen_per_kwh: float,
     bg_fee_yen_per_kwh: float,
     fip_premium_years: int,
@@ -186,8 +186,8 @@ def _normalize_and_validate(
         )
     if annual_curtailment_rate_pct > 30:
         warnings.append("制御率30%超では内蔵プロファイルの確率クリップにより実現制御率が目標を下回る場合があります")
-    if fip_premium_yen_per_kwh == 0:
-        warnings.append("FIPプレミアムが0円です（プレミアムなしの市場直売想定）")
+    if fip_base_price_yen_per_kwh == 0:
+        warnings.append("FIP基準価格が0円です（FIP認定を受けない市場直売想定になります）")
     if case == "B" and pv_acquisition_cost_yen <= 0:
         warnings.append("pv_acquisition_cost_yen が未指定のため、ライフサイクルCF表示は省略されます（増分IRR計算には影響なし）")
 
@@ -195,6 +195,28 @@ def _normalize_and_validate(
         max(0, int(fit_term_years) - int(fip_transition_year) + 1)
         if case == "B" else int(fip_premium_years)
     )
+
+    # 参照価格の事前見積もり（LP実行なし、DBから直接算定）。
+    # 実際の値は simulate 実行時に発電量重み付けと無関係な単純平均で再計算されるが、
+    # LPを回す前に「基準価格から実際どれだけ差し引かれるか」を確認できるようにする。
+    reference_price_preview = None
+    premium_preview = None
+    if not errors and jepx_area in app.JEPX_AREAS and years:
+        try:
+            conn = sqlite3.connect(app.JEPX_DB_PATH)
+            ph = ",".join(["?"] * len(years))
+            row = conn.execute(
+                f"SELECT AVG(p) FROM ("
+                f"SELECT AVG(price) AS p FROM jepx_prices "
+                f"WHERE area = ? AND fiscal_year IN ({ph}) GROUP BY date, slot)",
+                [jepx_area] + years,
+            ).fetchone()
+            conn.close()
+            if row and row[0] is not None:
+                reference_price_preview = round(float(row[0]), 2)
+                premium_preview = round(float(fip_base_price_yen_per_kwh) - reference_price_preview, 2)
+        except Exception:
+            pass  # プレビューに失敗してもエラーにはしない（simulate側で正式算定される）
 
     params = {
         "case": "新規FIP" if case == "A" else "既存FIT→FIP転",
@@ -217,7 +239,9 @@ def _normalize_and_validate(
         "battery_replace_cost_ratio_pct": float(battery_replace_cost_ratio_pct),
         "jepx_area": jepx_area,
         "jepx_fiscal_years": years,
-        "fip_premium_yen_per_kwh": float(fip_premium_yen_per_kwh),
+        "fip_base_price_yen_per_kwh": float(fip_base_price_yen_per_kwh),
+        "reference_price_preview_yen_per_kwh": reference_price_preview,
+        "premium_preview_yen_per_kwh": premium_preview,
         "nonfossil_price_yen_per_kwh": float(nonfossil_price_yen_per_kwh),
         "bg_fee_yen_per_kwh": float(bg_fee_yen_per_kwh),
         "effective_premium_years": effective_premium_years,
@@ -287,16 +311,25 @@ def _run_fip_simulation(case: str, p: dict):
     curtail_prob = app.build_curtail_prob_30min(
         result["month_day"], p["annual_curtailment_rate_pct"], generation_30min=gen
     )
+
+    # 参照価格 = 選択エリア・年度のJEPX単純平均。実効プレミアム = 基準価格 − 参照価格。
+    # ユーザー（エージェント）は公表済みの「基準価格」をそのまま渡せばよく、
+    # 市場への上乗せ額の計算はここで行う（基準価格をそのままプレミアムにする誤りを防ぐ）。
+    reference_price = float(np.mean(jepx_prices))
+    premium_effective = p["fip_base_price_yen_per_kwh"] - reference_price
+    p["reference_price_yen_per_kwh"] = round(reference_price, 2)
+    p["premium_effective_yen_per_kwh"] = round(premium_effective, 2)
+
     baseline = app.baseline_no_battery(
         gen, jepx_prices, result["month_day"],
-        premium=p["fip_premium_yen_per_kwh"],
+        premium=premium_effective,
         nonfossil_price=p["nonfossil_price_yen_per_kwh"],
         bg_fee=p["bg_fee_yen_per_kwh"],
         curtail_prob=curtail_prob,
     )
     baseline_no_prem_rev = (
         baseline["annual_revenue"]
-        - baseline["annual_export"] * p["fip_premium_yen_per_kwh"]
+        - baseline["annual_export"] * premium_effective
     )
 
     if p["battery_capacity_kwh"] > 0:
@@ -309,7 +342,7 @@ def _run_fip_simulation(case: str, p: dict):
             eff_discharge_pct=p["battery_discharge_efficiency_pct"],
             soc_min_pct=p["battery_soc_min_pct"],
             soc_max_pct=p["battery_soc_max_pct"],
-            premium=p["fip_premium_yen_per_kwh"],
+            premium=premium_effective,
             nonfossil_price=p["nonfossil_price_yen_per_kwh"],
             bg_fee=p["bg_fee_yen_per_kwh"],
             curtail_prob=curtail_prob,
@@ -318,7 +351,7 @@ def _run_fip_simulation(case: str, p: dict):
         opt = _zero_battery_opt_result(baseline, gen.shape)
 
     opt_no_prem_rev = (
-        opt["annual_revenue"] - opt["annual_export"] * p["fip_premium_yen_per_kwh"]
+        opt["annual_revenue"] - opt["annual_export"] * premium_effective
     )
 
     pv_capex_gross = p["ppeak_kw"] * p["pv_cost_yen_per_kw"]
@@ -397,6 +430,11 @@ def _run_fip_simulation(case: str, p: dict):
 
     irr = cf_result["project_irr"]
     caveats = list(_COMMON_CAVEATS)
+    caveats.append(
+        f"実効プレミアム{p['premium_effective_yen_per_kwh']:+.2f}円/kWhは、"
+        f"基準価格{p['fip_base_price_yen_per_kwh']:.2f}円 − 参照価格{p['reference_price_yen_per_kwh']:.2f}円"
+        "（選択年度JEPX単純平均から自動算定）で計算しています"
+    )
     if is_case_b:
         caveats.append("ケースBのIRR/NPV/回収年数は「FIP転+蓄電池 − FIT継続」の増分CFで評価しています")
 
@@ -588,7 +626,7 @@ def validate_fip_params(
     battery_replace_cost_ratio_pct: float = 60.0,
     jepx_area: str = "東京",
     jepx_fiscal_years: list[int] = [2023, 2024, 2025],
-    fip_premium_yen_per_kwh: float = 9.6,
+    fip_base_price_yen_per_kwh: float = 9.6,
     nonfossil_price_yen_per_kwh: float = 0.6,
     bg_fee_yen_per_kwh: float = 2.0,
     fip_premium_years: int = 20,
@@ -634,7 +672,7 @@ def validate_fip_params(
         battery_replace_cost_ratio_pct: 交換時単価の当初比 [%]
         jepx_area: JEPXエリア（北海道/東北/東京/中部/北陸/関西/中国/四国/九州）
         jepx_fiscal_years: JEPX価格年度リスト（2020〜2025、複数年平均）
-        fip_premium_yen_per_kwh: FIPプレミアム [円/kWh]
+        fip_base_price_yen_per_kwh: FIP基準価格 [円/kWh]（公表値をそのまま指定。参照価格は自動算定）
         nonfossil_price_yen_per_kwh: 非化石証書単価 [円/kWh]
         bg_fee_yen_per_kwh: バランシンググループ手数料 [円/kWh]
         fip_premium_years: プレミアム交付期間 [年]（ケースAのみ。ケースBはFIT残存期間で自動計算）
@@ -657,6 +695,9 @@ def validate_fip_params(
 
     Returns:
         dict: {"valid": bool, "normalized_params": {...}, "warnings": [...], "errors": [...]}
+              normalized_params には reference_price_preview_yen_per_kwh（選択年度JEPX
+              単純平均の概算）と premium_preview_yen_per_kwh（基準価格−参照価格の概算）
+              を含む。simulate実行前にユーザーへ提示し、実効プレミアムの大きさを確認すること
     """
     try:
         case = str(case).upper()
@@ -670,7 +711,7 @@ def validate_fip_params(
             battery_life_years, battery_degrade_pct_per_year,
             battery_eol_action, battery_replace_cost_ratio_pct,
             jepx_area, jepx_fiscal_years,
-            fip_premium_yen_per_kwh, nonfossil_price_yen_per_kwh, bg_fee_yen_per_kwh,
+            fip_base_price_yen_per_kwh, nonfossil_price_yen_per_kwh, bg_fee_yen_per_kwh,
             fip_premium_years, annual_curtailment_rate_pct,
             pv_cost_yen_per_kw, battery_cost_yen_per_kwh,
             subsidy_pv_pct, subsidy_battery_pct,
@@ -712,7 +753,7 @@ def simulate_fip_case_a(
     battery_replace_cost_ratio_pct: float = 60.0,
     jepx_area: str = "東京",
     jepx_fiscal_years: list[int] = [2023, 2024, 2025],
-    fip_premium_yen_per_kwh: float = 9.6,
+    fip_base_price_yen_per_kwh: float = 9.6,
     nonfossil_price_yen_per_kwh: float = 0.6,
     bg_fee_yen_per_kwh: float = 2.0,
     fip_premium_years: int = 20,
@@ -757,7 +798,7 @@ def simulate_fip_case_a(
         battery_replace_cost_ratio_pct: 交換時単価の当初比 [%]
         jepx_area: JEPXエリア名
         jepx_fiscal_years: JEPX価格年度リスト（複数年平均）
-        fip_premium_yen_per_kwh: FIPプレミアム [円/kWh]
+        fip_base_price_yen_per_kwh: FIP基準価格 [円/kWh]（公表値をそのまま指定。参照価格は自動算定）
         nonfossil_price_yen_per_kwh: 非化石証書単価 [円/kWh]
         bg_fee_yen_per_kwh: バランシンググループ手数料 [円/kWh]
         fip_premium_years: プレミアム交付期間 [年]
@@ -793,7 +834,7 @@ def simulate_fip_case_a(
         battery_eol_action=battery_eol_action,
         battery_replace_cost_ratio_pct=battery_replace_cost_ratio_pct,
         jepx_area=jepx_area, jepx_fiscal_years=jepx_fiscal_years,
-        fip_premium_yen_per_kwh=fip_premium_yen_per_kwh,
+        fip_base_price_yen_per_kwh=fip_base_price_yen_per_kwh,
         nonfossil_price_yen_per_kwh=nonfossil_price_yen_per_kwh,
         bg_fee_yen_per_kwh=bg_fee_yen_per_kwh,
         fip_premium_years=fip_premium_years,
@@ -837,7 +878,7 @@ def simulate_fip_case_b(
     battery_replace_cost_ratio_pct: float = 60.0,
     jepx_area: str = "東京",
     jepx_fiscal_years: list[int] = [2023, 2024, 2025],
-    fip_premium_yen_per_kwh: float = 9.6,
+    fip_base_price_yen_per_kwh: float = 9.6,
     nonfossil_price_yen_per_kwh: float = 0.6,
     bg_fee_yen_per_kwh: float = 2.0,
     annual_curtailment_rate_pct: float = 0.0,
@@ -886,7 +927,7 @@ def simulate_fip_case_b(
         battery_replace_cost_ratio_pct: 交換時単価の当初比 [%]
         jepx_area: JEPXエリア名
         jepx_fiscal_years: JEPX価格年度リスト（複数年平均）
-        fip_premium_yen_per_kwh: FIPプレミアム（基準価格−参照価格）[円/kWh]
+        fip_base_price_yen_per_kwh: FIP基準価格 [円/kWh]（公表値をそのまま指定。参照価格は自動算定）
         nonfossil_price_yen_per_kwh: 非化石証書単価 [円/kWh]
         bg_fee_yen_per_kwh: バランシンググループ手数料 [円/kWh]
         annual_curtailment_rate_pct: FIP転後の年間出力制御率 [%]
@@ -925,7 +966,7 @@ def simulate_fip_case_b(
         battery_eol_action=battery_eol_action,
         battery_replace_cost_ratio_pct=battery_replace_cost_ratio_pct,
         jepx_area=jepx_area, jepx_fiscal_years=jepx_fiscal_years,
-        fip_premium_yen_per_kwh=fip_premium_yen_per_kwh,
+        fip_base_price_yen_per_kwh=fip_base_price_yen_per_kwh,
         nonfossil_price_yen_per_kwh=nonfossil_price_yen_per_kwh,
         bg_fee_yen_per_kwh=bg_fee_yen_per_kwh,
         annual_curtailment_rate_pct=annual_curtailment_rate_pct,
