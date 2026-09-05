@@ -214,7 +214,16 @@ def _normalize_and_validate(
             conn.close()
             if row and row[0] is not None:
                 reference_price_preview = round(float(row[0]), 2)
-                premium_preview = round(float(fip_base_price_yen_per_kwh) - reference_price_preview, 2)
+                raw = float(fip_base_price_yen_per_kwh) - reference_price_preview
+                # ゼロ下限クリップ（simulate側と同じ扱い）
+                premium_preview = round(max(0.0, raw), 2)
+                if raw < 0:
+                    warnings.append(
+                        f"参照価格{reference_price_preview:.2f}円/kWh（選択エリア・年度のJEPX平均）が"
+                        f"基準価格{fip_base_price_yen_per_kwh:.2f}円/kWhを上回るため、"
+                        "プレミアムは0円/kWhに制限されます（FIP制度上、負のプレミアムは発生しません）。"
+                        "この条件ではFIPによる収益上乗せがないため、市場直売と同等の採算になります"
+                    )
         except Exception:
             pass  # プレビューに失敗してもエラーにはしない（simulate側で正式算定される）
 
@@ -277,6 +286,8 @@ def _zero_battery_opt_result(baseline, gen_shape):
         "annual_charge": 0.0,
         "annual_discharge": 0.0,
         "annual_curtail": baseline["annual_curtail"],
+        "annual_curtail_forced": baseline.get("annual_curtail_forced", baseline["annual_curtail"]),
+        "annual_curtail_economic": baseline.get("annual_curtail_economic", 0.0),
         "annual_revenue": baseline["annual_revenue"],
         "curtailment": baseline["curtailment"],
         "battery_charge": zero,
@@ -315,10 +326,15 @@ def _run_fip_simulation(case: str, p: dict):
     # 参照価格 = 選択エリア・年度のJEPX単純平均。実効プレミアム = 基準価格 − 参照価格。
     # ユーザー（エージェント）は公表済みの「基準価格」をそのまま渡せばよく、
     # 市場への上乗せ額の計算はここで行う（基準価格をそのままプレミアムにする誤りを防ぐ）。
+    # ゼロ下限クリップ: 参照価格が基準価格を上回ってもプレミアムはゼロ止まり
+    # （FIP制度に事業者から差額を徴収する仕組みは存在しないため）。
     reference_price = float(np.mean(jepx_prices))
-    premium_effective = p["fip_base_price_yen_per_kwh"] - reference_price
+    premium_raw = p["fip_base_price_yen_per_kwh"] - reference_price
+    premium_effective = max(0.0, premium_raw)
+    premium_clipped = premium_raw < 0
     p["reference_price_yen_per_kwh"] = round(reference_price, 2)
     p["premium_effective_yen_per_kwh"] = round(premium_effective, 2)
+    p["premium_clipped_at_zero"] = premium_clipped
 
     baseline = app.baseline_no_battery(
         gen, jepx_prices, result["month_day"],
@@ -410,7 +426,13 @@ def _run_fip_simulation(case: str, p: dict):
         }
 
     # --- 構造化出力 ---
-    avoided = baseline["annual_curtail"] - float(np.sum(opt["curtailment"]))
+    # 抑制は「強制出力制御」と「経済的自主抑制」で意味がまったく異なるため分けて報告する。
+    # 蓄電池の効果（回避量）は強制出力制御分のみで評価する（自主抑制は蓄電池の価値ではない）。
+    base_forced = baseline.get("annual_curtail_forced", baseline["annual_curtail"])
+    base_econ = baseline.get("annual_curtail_economic", 0.0)
+    opt_forced = opt.get("annual_curtail_forced", float(np.sum(opt["curtailment"])))
+    opt_econ = opt.get("annual_curtail_economic", 0.0)
+    avoided = base_forced - opt_forced
     cashflow_rows = []
     for r in cf_result["rows"]:
         row_out = {
@@ -430,11 +452,19 @@ def _run_fip_simulation(case: str, p: dict):
 
     irr = cf_result["project_irr"]
     caveats = list(_COMMON_CAVEATS)
-    caveats.append(
-        f"実効プレミアム{p['premium_effective_yen_per_kwh']:+.2f}円/kWhは、"
-        f"基準価格{p['fip_base_price_yen_per_kwh']:.2f}円 − 参照価格{p['reference_price_yen_per_kwh']:.2f}円"
-        "（選択年度JEPX単純平均から自動算定）で計算しています"
-    )
+    if p.get("premium_clipped_at_zero"):
+        caveats.append(
+            f"参照価格{p['reference_price_yen_per_kwh']:.2f}円/kWhが"
+            f"基準価格{p['fip_base_price_yen_per_kwh']:.2f}円/kWhを上回るため、"
+            "プレミアムを0円/kWhに制限しました（FIP制度上、参照価格超過分を事業者から"
+            "徴収する仕組みは存在しません）。この条件ではFIPプレミアムによる収益上乗せは発生しません"
+        )
+    else:
+        caveats.append(
+            f"実効プレミアム{p['premium_effective_yen_per_kwh']:+.2f}円/kWhは、"
+            f"基準価格{p['fip_base_price_yen_per_kwh']:.2f}円 − 参照価格{p['reference_price_yen_per_kwh']:.2f}円"
+            "（選択年度JEPX単純平均から自動算定）で計算しています"
+        )
     if is_case_b:
         caveats.append("ケースBのIRR/NPV/回収年数は「FIP転+蓄電池 − FIT継続」の増分CFで評価しています")
 
@@ -458,8 +488,17 @@ def _run_fip_simulation(case: str, p: dict):
             "battery_discharge_kwh": round(opt["annual_discharge"]),
             "curtailed_without_battery_kwh": round(baseline["annual_curtail"]),
             "curtailed_with_battery_kwh": round(float(np.sum(opt["curtailment"]))),
+            # 強制出力制御（系統指令）— 蓄電池が回避できるのはこちらのみ
+            "forced_curtailed_without_battery_kwh": round(base_forced),
+            "forced_curtailed_with_battery_kwh": round(opt_forced),
             "curtailment_avoided_kwh": round(avoided),
+            # 経済的自主抑制（売電単価が負のコマで出力を絞った量）— 蓄電池の価値ではない
+            "economic_curtailed_without_battery_kwh": round(base_econ),
+            "economic_curtailed_with_battery_kwh": round(opt_econ),
             "avg_jepx_price_yen_per_kwh": round(float(np.mean(jepx_prices)), 2),
+            "curtailment_note": "curtailment_avoided_kwh は強制出力制御分のみの回避量。"
+                                "経済的自主抑制は売電すると損失になるコマで出力を絞った量であり、"
+                                "蓄電池の有無にかかわらず発生する（意味が異なるため合算しない）",
         },
         "cashflow": cashflow_rows,
         "caseb_comparison": caseb_comparison,

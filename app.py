@@ -604,29 +604,47 @@ def baseline_no_battery(generation_30min, jepx_prices, month_day,
                         curtail_prob=None):
     """蓄電池なしの場合の売電・収益を計算する。
 
-    PV発電量を全量JEPX市場に売電するシンプルな計算。
+    PV発電量をJEPX市場に売電するシンプルな計算。
     収益単価 = JEPX価格 + プレミアム + 非化石証書 − BG手数料
-    出力制御がある場合は制御後発電量を売電する（回避不可）。
+
+    2種類の抑制を扱う:
+      1. 強制出力制御（系統からの指令）: curtail_prob 由来。回避不可
+      2. 経済的自主抑制: 売電単価が負のコマは売ると損失になるため出力を絞る。
+         LP側（optimize_battery_fip）は curtail 変数で同じ判断を行うため、
+         ベースライン側にも同じ選択肢を与えないと「自主抑制できること自体の価値」が
+         蓄電池の増分収益に混入する（with/without の非対称性）。
 
     Returns:
         dict: 年間/月別の発電量・売電量・収益・制御損失
+              curtailment は強制＋自主の合計。内訳は annual_curtail_forced /
+              annual_curtail_economic で個別に返す。
     """
     n_days = generation_30min.shape[0]
 
     if curtail_prob is None:
         curtail_prob = np.zeros_like(generation_30min)
 
-    # 制御後発電量 = (1 - 制御確率) × 元発電量
-    gen_after, curtail_amount = apply_curtailment(generation_30min, curtail_prob)
+    # 1. 強制出力制御後の発電量 = (1 - 制御確率) × 元発電量
+    gen_after, curtail_forced = apply_curtailment(generation_30min, curtail_prob)
 
     # 単価マトリクス (365, 48)
     revenue_unit = jepx_prices + premium + nonfossil_price - bg_fee  # 円/kWh
-    # 収益 = 制御後発電量 × 単価
-    revenue_30min = gen_after * revenue_unit  # 円
 
-    annual_gen = float(np.sum(generation_30min))         # 制御前
-    annual_curtail = float(np.sum(curtail_amount))       # 制御損失
-    annual_export = float(np.sum(gen_after))             # 売電量＝制御後
+    # 2. 経済的自主抑制: 単価が負のコマは売電せず出力を絞る（LP側と対称）
+    loss_making = revenue_unit < 0
+    curtail_economic = np.where(loss_making, gen_after, 0.0)
+    export_final = np.where(loss_making, 0.0, gen_after)
+
+    curtail_amount = curtail_forced + curtail_economic
+
+    # 収益 = 売電量 × 単価
+    revenue_30min = export_final * revenue_unit  # 円
+
+    annual_gen = float(np.sum(generation_30min))                 # 制御前
+    annual_curtail = float(np.sum(curtail_amount))               # 抑制合計
+    annual_curtail_forced = float(np.sum(curtail_forced))        # うち強制出力制御
+    annual_curtail_economic = float(np.sum(curtail_economic))    # うち経済的自主抑制
+    annual_export = float(np.sum(export_final))
     annual_revenue = float(np.sum(revenue_30min))
 
     monthly_gen = {}
@@ -636,16 +654,20 @@ def baseline_no_battery(generation_30min, jepx_prices, month_day,
     for i in range(n_days):
         m = month_day[i][0]
         monthly_gen[m] = monthly_gen.get(m, 0) + np.sum(generation_30min[i])
-        monthly_export[m] = monthly_export.get(m, 0) + np.sum(gen_after[i])
+        monthly_export[m] = monthly_export.get(m, 0) + np.sum(export_final[i])
         monthly_revenue[m] = monthly_revenue.get(m, 0) + np.sum(revenue_30min[i])
         monthly_curtail[m] = monthly_curtail.get(m, 0) + np.sum(curtail_amount[i])
 
     return {
-        "export": gen_after,
+        "export": export_final,
         "curtailment": curtail_amount,
+        "curtailment_forced": curtail_forced,
+        "curtailment_economic": curtail_economic,
         "revenue_30min": revenue_30min,
         "annual_gen": annual_gen,
         "annual_curtail": annual_curtail,
+        "annual_curtail_forced": annual_curtail_forced,
+        "annual_curtail_economic": annual_curtail_economic,
         "annual_export": annual_export,
         "annual_revenue": annual_revenue,
         "monthly_gen": monthly_gen,
@@ -771,12 +793,21 @@ def optimize_battery_fip(generation_30min, jepx_prices, month_day,
     # 30分コマごとの収益
     revenue_30min = export_vals * unit_price.reshape(n_days, n_slots)
 
+    # 抑制の内訳分解（ベースライン側と同じ基準で分類）
+    # 売電単価が負のコマの抑制 = 経済的自主抑制、それ以外 = 強制出力制御由来
+    unit_price_2d = unit_price.reshape(n_days, n_slots)
+    loss_making = unit_price_2d < 0
+    curtail_economic_vals = np.where(loss_making, curtail_vals, 0.0)
+    curtail_forced_vals = np.where(loss_making, 0.0, curtail_vals)
+
     # 年間集計
     annual_gen = float(np.sum(generation_30min))
     annual_export = float(np.sum(export_vals))
     annual_charge = float(np.sum(charge_vals))
     annual_discharge = float(np.sum(discharge_vals))
     annual_curtail = float(np.sum(curtail_vals))
+    annual_curtail_forced = float(np.sum(curtail_forced_vals))
+    annual_curtail_economic = float(np.sum(curtail_economic_vals))
     annual_revenue = float(pulp.value(prob.objective))
 
     # 月別集計
@@ -798,6 +829,8 @@ def optimize_battery_fip(generation_30min, jepx_prices, month_day,
         "battery_discharge": discharge_vals,
         "export": export_vals,
         "curtailment": curtail_vals,
+        "curtailment_forced": curtail_forced_vals,
+        "curtailment_economic": curtail_economic_vals,
         "soc": soc_vals,
         "revenue_30min": revenue_30min,
         "annual_gen": annual_gen,
@@ -805,6 +838,8 @@ def optimize_battery_fip(generation_30min, jepx_prices, month_day,
         "annual_charge": annual_charge,
         "annual_discharge": annual_discharge,
         "annual_curtail": annual_curtail,
+        "annual_curtail_forced": annual_curtail_forced,
+        "annual_curtail_economic": annual_curtail_economic,
         "annual_revenue": annual_revenue,
         "monthly_gen": monthly_gen,
         "monthly_export": monthly_export,
@@ -2041,8 +2076,14 @@ def run_simulation(
         # 実効プレミアム = 基準価格 − 参照価格。ユーザーは公表済みの「基準価格」を
         # そのまま入力し、市場への上乗せ額はここで自動計算する
         # （基準価格をそのままプレミアムとして加算する誤りを構造的に防ぐ）。
+        #
+        # ゼロ下限クリップ: FIP制度では参照価格が基準価格を上回っても
+        # プレミアムはゼロ止まりであり、事業者から差額を徴収する仕組みは存在しない。
+        # 負のプレミアムは制度上あり得ないため max(0, ...) でクリップする。
         reference_price = float(np.mean(jepx_prices))
-        fip_premium_effective = float(fip_base_price) - reference_price
+        fip_premium_raw = float(fip_base_price) - reference_price
+        fip_premium_effective = max(0.0, fip_premium_raw)
+        premium_clipped = fip_premium_raw < 0
 
         # --- 出力制御プロファイル（エネルギー重み付け） ---
         curtail_prob = build_curtail_prob_30min(
@@ -2181,6 +2222,8 @@ def run_simulation(
                 "annual_charge": 0.0,
                 "annual_discharge": 0.0,
                 "annual_curtail": baseline["annual_curtail"],
+                "annual_curtail_forced": baseline["annual_curtail_forced"],
+                "annual_curtail_economic": baseline["annual_curtail_economic"],
                 "annual_revenue": baseline["annual_revenue"],
                 "monthly_gen": baseline["monthly_gen"],
                 "monthly_export": baseline["monthly_export"],
@@ -2331,16 +2374,28 @@ def run_simulation(
         result_text += f"FIP基準価格: {float(fip_base_price):.2f} 円/kWh\n"
         result_text += f"参照価格（算定、選択年度JEPX単純平均）: {reference_price:.2f} 円/kWh\n"
         result_text += f"実効プレミアム（基準価格−参照価格）: {fip_premium_effective:+.2f} 円/kWh\n"
+        if premium_clipped:
+            result_text += (
+                f"  ⚠ 参照価格が基準価格を上回るため、プレミアムを0円/kWhに制限しました\n"
+                f"    （制度上、参照価格超過分を事業者から徴収する仕組みはありません。"
+                f"素の差分は {fip_premium_raw:+.2f} 円/kWh）\n"
+            )
         result_text += f"非化石証書: {float(nonfossil_price):.2f} 円/kWh\n"
         result_text += f"BG手数料: -{float(bg_fee):.2f} 円/kWh\n"
         result_text += f"年平均売電単価: {unit_avg:.2f} 円/kWh\n\n"
 
-        result_text += "── 出力制御 ──\n"
+        result_text += "── 出力制御・抑制 ──\n"
         result_text += f"年間制御率（設定）: {float(annual_curtail_rate_pct):.1f}%\n"
-        result_text += f"蓄電池なし制御損失: {baseline['annual_curtail']:.0f} kWh/年\n"
-        result_text += f"蓄電池あり制御損失: {float(np.sum(opt_result['curtailment'])):.0f} kWh/年\n"
-        avoided = baseline['annual_curtail'] - float(np.sum(opt_result['curtailment']))
-        result_text += f"出力制御回避量（蓄電池効果）: {avoided:.0f} kWh/年\n\n"
+        base_forced = baseline.get("annual_curtail_forced", baseline["annual_curtail"])
+        base_econ = baseline.get("annual_curtail_economic", 0.0)
+        opt_forced = opt_result.get("annual_curtail_forced", opt_result.get("annual_curtail", 0.0))
+        opt_econ = opt_result.get("annual_curtail_economic", 0.0)
+        result_text += f"[強制出力制御] 蓄電池なし: {base_forced:.0f} kWh/年 → あり: {opt_forced:.0f} kWh/年\n"
+        result_text += f"  出力制御回避量（蓄電池効果）: {base_forced - opt_forced:.0f} kWh/年\n"
+        if base_econ > 0 or opt_econ > 0:
+            result_text += f"[経済的自主抑制] 蓄電池なし: {base_econ:.0f} kWh/年 → あり: {opt_econ:.0f} kWh/年\n"
+            result_text += "  ※売電単価が負のコマで出力を絞った量（強制制御とは別物）\n"
+        result_text += "\n"
 
         result_text += "── 蓄電池なし（ベースライン） ──\n"
         result_text += f"年間売電量: {baseline['annual_export']:.0f} kWh/年\n"
