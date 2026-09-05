@@ -1283,14 +1283,13 @@ def build_fit_continuation_cashflow(
     irr_period_years,
     pv_capex_sunk,
     om_ratio_pct,
+    fit_curtailment_rate_pct=0.0,
 ):
     """ケースB比較用: 「FIP転しない（FIT継続）」シナリオの20年間CF。
 
     Phase 1 (year 1..fit_remaining_years): FIT単価で買取り（蓄電池なし）
     Phase 2 (year (fit_remaining_years+1)..irr_period_years):
              FIT満了後はJEPX直売（蓄電池なし、プレミアム無し）
-
-    FIT期間中は出力制御率 = 0（FIT優先） を仮定。
 
     Args:
         annual_gen_kwh: 年間発電量 [kWh/年]（出力制御なし）
@@ -1300,17 +1299,21 @@ def build_fit_continuation_cashflow(
         irr_period_years: P-IRR計算期間 [年]
         pv_capex_sunk: PV既投資額（O&M計算のみに使用）[円]
         om_ratio_pct: O&M費率 [%/年]（PV CAPEX比）
+        fit_curtailment_rate_pct: FIT期間中の出力制御率 [%]（CLAUDE.md §4-6）。
+            デフォルト0=FIT優先で制御されない前提。年間発電量に対する単純な
+            エネルギー損失率として適用（時間帯別プロファイルは持たない集計値のため）。
 
     Returns:
         dict: FIT継続CF（行リストと20年累計CF）
     """
     pv_om = pv_capex_sunk * (om_ratio_pct / 100.0)
+    fit_export_factor = 1.0 - float(fit_curtailment_rate_pct) / 100.0
     rows = []
     rows.append({"year": 0, "revenue": 0.0, "om": 0.0, "ebitda": 0.0, "cum": 0.0})
     cum = 0.0
     for y in range(1, irr_period_years + 1):
         if y <= fit_remaining_years:
-            rev = annual_gen_kwh * fit_tariff  # FIT期間
+            rev = annual_gen_kwh * fit_export_factor * fit_tariff  # FIT期間（出力制御反映）
         else:
             rev = annual_revenue_jepx_direct_no_premium  # FIT満了後はJEPX直売
         ebitda = rev - pv_om
@@ -1337,6 +1340,7 @@ def build_caseb_display_rows(
     pv_acquisition_cost,
     om_ratio_pct,
     bat_net_capex,
+    fit_curtailment_rate_pct=0.0,
 ):
     """ケースB（既存FIT→FIP転）のCFチャート表示用の年次行を構築する。
 
@@ -1359,6 +1363,7 @@ def build_caseb_display_rows(
       これは純粋に「チャート表示用」のロウ列。
     """
     pv_om = pv_acquisition_cost * (om_ratio_pct / 100.0)
+    fit_export_factor = 1.0 - float(fit_curtailment_rate_pct) / 100.0
     rows = []
 
     # --- Plant year 0: PV 初期投資 ---
@@ -1381,7 +1386,7 @@ def build_caseb_display_rows(
 
     # --- Plant year 1..(fip_transition_year - 1): FIT phase ---
     for py in range(1, int(fip_transition_year)):
-        rev = annual_gen_kwh * float(fit_tariff)
+        rev = annual_gen_kwh * fit_export_factor * float(fit_tariff)
         ebitda = rev - pv_om
         cum += ebitda
         cum_net += ebitda
@@ -2001,6 +2006,7 @@ def run_simulation(
     fit_term_years=20,                    # FIT契約期間 [年]（通常20）
     fip_transition_year=12,               # FIP転を実施する年（FIT開始から数えて）
     pv_acquisition_cost=0.0,              # PV取得価額 [円]（ケースB、サンクコスト）
+    fit_curtailment_rate_pct=0.0,         # FIT期間中の出力制御率 [%]（ケースB、CLAUDE.md §4-6）
 ):
     """メイン計算コールバック"""
     try:
@@ -2309,6 +2315,7 @@ def run_simulation(
                 irr_period_years=int(irr_period_years),
                 pv_capex_sunk=float(pv_acquisition_cost),
                 om_ratio_pct=float(om_ratio_pct),
+                fit_curtailment_rate_pct=float(fit_curtailment_rate_pct),
             )
 
             # === 増分CFに基づくProject IRR/NPV/回収年数の再計算 ===
@@ -2335,6 +2342,7 @@ def run_simulation(
                 pv_acquisition_cost=float(pv_acquisition_cost),
                 om_ratio_pct=float(om_ratio_pct),
                 bat_net_capex=cf_result["net_capex"],
+                fit_curtailment_rate_pct=float(fit_curtailment_rate_pct),
             )
             cf_for_chart = dict(cf_result)
             cf_for_chart["rows"] = display_rows
@@ -2432,6 +2440,7 @@ def run_simulation(
             result_text += f"FIT契約期間: {int(fit_term_years)}年 / "
             result_text += f"FIP転実施年: {int(fip_transition_year)}年目 / "
             result_text += f"FIPプレミアム期間（FIT残存）: {effective_premium_years}年\n"
+            result_text += f"FIT期間中の出力制御率（FIT継続比較シナリオに適用）: {float(fit_curtailment_rate_pct):.1f}%\n"
         else:
             result_text += f"FIPプレミアム期間: {effective_premium_years}年\n"
         result_text += "\n"
@@ -2589,6 +2598,11 @@ def build_ui():
                         pv_acquisition_cost_input = gr.Number(
                             label="PV取得価額 [円]（FIT継続比較用、任意）",
                             value=0, precision=0,
+                        )
+                    with gr.Row():
+                        fit_curtailment_rate_input = gr.Number(
+                            label="FIT期間中の出力制御率 [%]（比較対象「FIT継続」シナリオに適用）",
+                            value=0.0, precision=2,
                         )
                     gr.Markdown(
                         "<small>FIPプレミアム交付期間 = FIT残存期間（FIT契約期間 − FIP転実施年 + 1）。"
@@ -2890,12 +2904,14 @@ def build_ui():
         N_BASE = 43
         N_FACE = MAX_FACES * 5  # 40
         # 追加: bat_om_mode, om_bat_pcs, decom_pct, case_type, fip_premium_years,
-        #       fit_tariff, fit_term_years, fip_transition_year, pv_acquisition_cost
+        #       fit_tariff, fit_term_years, fip_transition_year, pv_acquisition_cost,
+        #       fit_curtailment_rate_pct
         extra_inputs = [
             bat_om_mode_input, om_bat_pcs_input, decom_pct_input,
             case_type_input, fip_premium_years_input,
             fit_tariff_input, fit_term_years_input,
             fip_transition_year_input, pv_acquisition_cost_input,
+            fit_curtailment_rate_input,
         ]
 
         def on_click(*args):
@@ -2907,6 +2923,7 @@ def build_ui():
             case_type_v, fip_premium_years_v = tail[6], tail[7]
             fit_tariff_v, fit_term_years_v = tail[8], tail[9]
             fip_transition_year_v, pv_acq_v = tail[10], tail[11]
+            fit_curtail_v = tail[12]
             return run_simulation(
                 *base, face_args,
                 num_faces=num_f,
@@ -2920,6 +2937,7 @@ def build_ui():
                 fit_term_years=fit_term_years_v,
                 fip_transition_year=fip_transition_year_v,
                 pv_acquisition_cost=pv_acq_v,
+                fit_curtailment_rate_pct=fit_curtail_v,
             )
 
         all_inputs_with_display = all_inputs + [num_faces_input, month_input, day_input] + extra_inputs

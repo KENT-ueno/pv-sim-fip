@@ -116,6 +116,7 @@ def _normalize_and_validate(
     fit_term_years: int,
     fip_transition_year: int,
     pv_acquisition_cost_yen: float,
+    fit_curtailment_rate_pct: float = 0.0,
 ):
     """パラメータを正規化し (params, warnings, errors) を返す。LPは実行しない。"""
     app = _get_app()
@@ -142,10 +143,15 @@ def _normalize_and_validate(
         errors.append(f"ppeak_kw は 0 < x <= {MAX_PPEAK_KW:.0f} で指定してください")
     if not (0 <= battery_capacity_kwh <= MAX_BATTERY_KWH):
         errors.append(f"battery_capacity_kwh は 0 <= x <= {MAX_BATTERY_KWH:.0f} で指定してください")
-    if not (0 < battery_max_charge_kw <= MAX_PCS_KW):
-        errors.append(f"battery_max_charge_kw は 0 < x <= {MAX_PCS_KW:.0f} で指定してください")
-    if not (0 < battery_max_discharge_kw <= MAX_PCS_KW):
-        errors.append(f"battery_max_discharge_kw は 0 < x <= {MAX_PCS_KW:.0f} で指定してください")
+    # 蓄電池なし（capacity=0）のときはPCSレートは意味を持たないためチェック対象外にする。
+    # capacity=0なら発電・売電計算はbaseline_no_batteryのみを使い、PCS値は一切参照されない。
+    if battery_capacity_kwh > 0:
+        if not (0 < battery_max_charge_kw <= MAX_PCS_KW):
+            errors.append(f"battery_max_charge_kw は 0 < x <= {MAX_PCS_KW:.0f} で指定してください")
+        if not (0 < battery_max_discharge_kw <= MAX_PCS_KW):
+            errors.append(f"battery_max_discharge_kw は 0 < x <= {MAX_PCS_KW:.0f} で指定してください")
+    elif battery_max_charge_kw < 0 or battery_max_discharge_kw < 0:
+        errors.append("battery_max_charge_kw / battery_max_discharge_kw は0以上で指定してください")
     if not (0 <= tilt_deg <= 90):
         errors.append("tilt_deg は 0〜90 で指定してください")
     azimuth_deg = float(azimuth_deg) % 360
@@ -274,6 +280,7 @@ def _normalize_and_validate(
             "fit_term_years": int(fit_term_years),
             "fip_transition_year": int(fip_transition_year),
             "pv_acquisition_cost_yen": float(pv_acquisition_cost_yen),
+            "fit_curtailment_rate_pct": float(fit_curtailment_rate_pct),
         })
     return params, warnings, errors
 
@@ -411,6 +418,7 @@ def _run_fip_simulation(case: str, p: dict):
             irr_period_years=p["irr_period_years"],
             pv_capex_sunk=p["pv_acquisition_cost_yen"],
             om_ratio_pct=p["om_ratio_pct_per_year"],
+            fit_curtailment_rate_pct=p.get("fit_curtailment_rate_pct", 0.0),
         )
         app.apply_caseb_incremental_metrics(cf_result, fit_cf, p["loan_interest_pct"])
 
@@ -450,6 +458,19 @@ def _run_fip_simulation(case: str, p: dict):
             row_out["incremental_project_cf_yen"] = round(r["incremental_project_cf"])
         cashflow_rows.append(row_out)
 
+    # 捕捉価格（capture price）: PVが実際に売電できているJEPX加重平均単価
+    # （プレミアム・非化石証書等を含まない、JEPX市場価格のみの捕捉状況）。
+    # PVの発電時間帯が市場価格の安い時間帯に偏っていると avg_jepx_price より低くなる。
+    avg_jepx_price = float(np.mean(jepx_prices))
+    export_for_capture = baseline["export"]
+    export_sum = float(np.sum(export_for_capture))
+    if export_sum > 0:
+        capture_price = float(np.sum(export_for_capture * jepx_prices)) / export_sum
+        capture_rate_pct = capture_price / avg_jepx_price * 100.0 if avg_jepx_price != 0 else None
+    else:
+        capture_price = None
+        capture_rate_pct = None
+
     irr = cf_result["project_irr"]
     caveats = list(_COMMON_CAVEATS)
     if p.get("premium_clipped_at_zero"):
@@ -473,11 +494,15 @@ def _run_fip_simulation(case: str, p: dict):
         "kpis": {
             "project_irr_pct": round(irr * 100, 2) if irr is not None else None,
             "project_npv_yen": round(cf_result["project_npv"]),
+            "discount_rate_pct": p["loan_interest_pct"],
             "payback_years": cf_result["payback_year"],
             "net_capex_yen": round(cf_result["net_capex"]),
             "annual_revenue_with_battery_yen": round(opt["annual_revenue"]),
             "annual_revenue_without_battery_yen": round(baseline["annual_revenue"]),
             "battery_annual_increment_yen": round(opt["annual_revenue"] - baseline["annual_revenue"]),
+            "discount_rate_note": "project_npv_yen は discount_rate_pct（借入金利をWACC近似として"
+                                  "流用）で割り引いています。loan_interest_pct を変更すると、"
+                                  "借入返済負担とNPV割引率の両方が連動して変わります",
         },
         "annual": {
             "generation_kwh": round(result["annual"]),
@@ -495,10 +520,16 @@ def _run_fip_simulation(case: str, p: dict):
             # 経済的自主抑制（売電単価が負のコマで出力を絞った量）— 蓄電池の価値ではない
             "economic_curtailed_without_battery_kwh": round(base_econ),
             "economic_curtailed_with_battery_kwh": round(opt_econ),
-            "avg_jepx_price_yen_per_kwh": round(float(np.mean(jepx_prices)), 2),
+            "avg_jepx_price_yen_per_kwh": round(avg_jepx_price, 2),
+            "capture_price_yen_per_kwh": round(capture_price, 2) if capture_price is not None else None,
+            "capture_rate_pct": round(capture_rate_pct, 1) if capture_rate_pct is not None else None,
             "curtailment_note": "curtailment_avoided_kwh は強制出力制御分のみの回避量。"
                                 "経済的自主抑制は売電すると損失になるコマで出力を絞った量であり、"
                                 "蓄電池の有無にかかわらず発生する（意味が異なるため合算しない）",
+            "capture_price_note": "capture_price_yen_per_kwh はPV（蓄電池なし）が実際に捕捉している"
+                                  "JEPX市場価格の加重平均（プレミアム等を含まない）。"
+                                  "avg_jepx_price比のcapture_rate_pctが低いほど、PVの発電時間帯と"
+                                  "市場価格の高い時間帯がズレていることを示す",
         },
         "cashflow": cashflow_rows,
         "caseb_comparison": caseb_comparison,
@@ -685,6 +716,7 @@ def validate_fip_params(
     fit_term_years: int = 20,
     fip_transition_year: int = 12,
     pv_acquisition_cost_yen: float = 0.0,
+    fit_curtailment_rate_pct: float = 0.0,
 ) -> dict:
     """FIP事業性シミュレーションのパラメータを検証する（即答・LP実行なし）。
 
@@ -731,6 +763,8 @@ def validate_fip_params(
         fit_term_years: FIT契約期間 [年]（ケースBのみ、通常20）
         fip_transition_year: FIP転実施年（FIT開始から何年目か。ケースBのみ）
         pv_acquisition_cost_yen: PV取得価額 [円]（ケースB、ライフサイクルCF表示用・任意）
+        fit_curtailment_rate_pct: FIT期間中の出力制御率 [%]（ケースBのみ。「FIP転しない場合」の
+            比較シナリオに適用。デフォルト0=FIT優先で制御されない前提）
 
     Returns:
         dict: {"valid": bool, "normalized_params": {...}, "warnings": [...], "errors": [...]}
@@ -758,7 +792,7 @@ def validate_fip_params(
             decommission_pct, equity_ratio_pct,
             loan_interest_pct, loan_years, irr_period_years,
             fit_tariff_yen_per_kwh, fit_term_years, fip_transition_year,
-            pv_acquisition_cost_yen,
+            pv_acquisition_cost_yen, fit_curtailment_rate_pct,
         )
         return {
             "valid": len(errors) == 0,
@@ -936,6 +970,7 @@ def simulate_fip_case_b(
     fit_term_years: int = 20,
     fip_transition_year: int = 12,
     pv_acquisition_cost_yen: float = 0.0,
+    fit_curtailment_rate_pct: float = 0.0,
 ) -> dict:
     """ケースB: 既存FIT発電所のFIP転＋蓄電池後付けの事業性を試算する（実行30〜90秒）。
 
@@ -985,6 +1020,8 @@ def simulate_fip_case_b(
         fit_term_years: FIT契約期間 [年]（通常20）
         fip_transition_year: FIP転を実施する年（FIT開始から何年目か）
         pv_acquisition_cost_yen: PV取得価額 [円]（任意、FIT継続比較の参考用）
+        fit_curtailment_rate_pct: FIT期間中の出力制御率 [%]（「FIP転しない場合」の
+            比較シナリオに適用。デフォルト0=FIT優先で制御されない前提）
 
     Returns:
         dict: assumptions / kpis（増分CFベースのIRR・NPV・回収年数）/ annual /
@@ -1021,6 +1058,7 @@ def simulate_fip_case_b(
         fit_term_years=fit_term_years,
         fip_transition_year=fip_transition_year,
         pv_acquisition_cost_yen=pv_acquisition_cost_yen,
+        fit_curtailment_rate_pct=fit_curtailment_rate_pct,
     )
     if not v.get("valid"):
         return {"error": "パラメータ検証エラー", "errors": v.get("errors", []),
