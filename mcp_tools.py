@@ -117,6 +117,7 @@ def _normalize_and_validate(
     fip_transition_year: int,
     pv_acquisition_cost_yen: float,
     fit_curtailment_rate_pct: float = 0.0,
+    pv_degrade_pct_per_year: float = 0.5,
 ):
     """パラメータを正規化し (params, warnings, errors) を返す。LPは実行しない。"""
     app = _get_app()
@@ -175,6 +176,8 @@ def _normalize_and_validate(
             errors.append(f"{name} は 50〜100 で指定してください")
     if not (0 <= annual_curtailment_rate_pct <= 50):
         errors.append("annual_curtailment_rate_pct は 0〜50 で指定してください")
+    if not (0 <= pv_degrade_pct_per_year <= 5):
+        errors.append("pv_degrade_pct_per_year は 0〜5 で指定してください")
 
     if case == "B":
         if not (1 <= int(fip_transition_year) <= int(fit_term_years)):
@@ -273,6 +276,10 @@ def _normalize_and_validate(
         "loan_interest_pct": float(loan_interest_pct),
         "loan_years": int(loan_years),
         "irr_period_years": int(irr_period_years),
+        "pv_degrade_pct_per_year": float(pv_degrade_pct_per_year),
+        # PVの既経過年数。ケースB: FIP転時点で何年稼働済みか（fip_transition_year-1）。
+        # ケースA: 新設のため0
+        "pv_start_age_years": (int(fip_transition_year) - 1) if case == "B" else 0,
     }
     if case == "B":
         params.update({
@@ -405,6 +412,8 @@ def _run_fip_simulation(case: str, p: dict):
         fip_premium_years=p["effective_premium_years"],
         annual_revenue_with_bat_no_premium=opt_no_prem_rev,
         annual_revenue_without_bat_no_premium=baseline_no_prem_rev,
+        pv_degrade_pct_per_year=p.get("pv_degrade_pct_per_year", 0.0),
+        pv_start_age_years=p.get("pv_start_age_years", 0),
     )
 
     caseb_comparison = None
@@ -419,6 +428,8 @@ def _run_fip_simulation(case: str, p: dict):
             pv_capex_sunk=p["pv_acquisition_cost_yen"],
             om_ratio_pct=p["om_ratio_pct_per_year"],
             fit_curtailment_rate_pct=p.get("fit_curtailment_rate_pct", 0.0),
+            pv_degrade_pct_per_year=p.get("pv_degrade_pct_per_year", 0.0),
+            pv_start_age_years=p.get("pv_start_age_years", 0),
         )
         app.apply_caseb_incremental_metrics(cf_result, fit_cf, p["loan_interest_pct"])
 
@@ -488,6 +499,13 @@ def _run_fip_simulation(case: str, p: dict):
         )
     if is_case_b:
         caveats.append("ケースBのIRR/NPV/回収年数は「FIP転+蓄電池 − FIT継続」の増分CFで評価しています")
+    pv_deg = p.get("pv_degrade_pct_per_year", 0.0)
+    if pv_deg > 0:
+        age_note = (f"（FIP転時点のPV既経過年数{p['pv_start_age_years']}年を起点に含む）"
+                    if p.get("pv_start_age_years", 0) > 0 else "")
+        caveats.append(
+            f"PV発電量は年{pv_deg:.2f}%の線形劣化を織り込んでキャッシュフローを算出しています{age_note}"
+        )
 
     return {
         "assumptions": p,
@@ -717,6 +735,7 @@ def validate_fip_params(
     fip_transition_year: int = 12,
     pv_acquisition_cost_yen: float = 0.0,
     fit_curtailment_rate_pct: float = 0.0,
+    pv_degrade_pct_per_year: float = 0.5,
 ) -> dict:
     """FIP事業性シミュレーションのパラメータを検証する（即答・LP実行なし）。
 
@@ -765,6 +784,8 @@ def validate_fip_params(
         pv_acquisition_cost_yen: PV取得価額 [円]（ケースB、ライフサイクルCF表示用・任意）
         fit_curtailment_rate_pct: FIT期間中の出力制御率 [%]（ケースBのみ。「FIP転しない場合」の
             比較シナリオに適用。デフォルト0=FIT優先で制御されない前提）
+        pv_degrade_pct_per_year: PV年間劣化率 [%/年]（線形、結晶シリコン一般値の目安0.5）。
+            ケースBはFIP転時点のPV既経過年数（fip_transition_year-1）を劣化計算の起点に含める
 
     Returns:
         dict: {"valid": bool, "normalized_params": {...}, "warnings": [...], "errors": [...]}
@@ -793,6 +814,7 @@ def validate_fip_params(
             loan_interest_pct, loan_years, irr_period_years,
             fit_tariff_yen_per_kwh, fit_term_years, fip_transition_year,
             pv_acquisition_cost_yen, fit_curtailment_rate_pct,
+            pv_degrade_pct_per_year,
         )
         return {
             "valid": len(errors) == 0,
@@ -842,6 +864,7 @@ def simulate_fip_case_a(
     loan_interest_pct: float = 2.0,
     loan_years: int = 15,
     irr_period_years: int = 20,
+    pv_degrade_pct_per_year: float = 0.5,
 ) -> dict:
     """ケースA: 新規FIP発電所＋蓄電池の事業性を試算する（実行30〜90秒、LP最適化を含む）。
 
@@ -887,6 +910,7 @@ def simulate_fip_case_a(
         loan_interest_pct: 借入金利 [%/年]
         loan_years: 借入期間 [年]
         irr_period_years: IRR計算期間 [年]
+        pv_degrade_pct_per_year: PV年間劣化率 [%/年]（線形、結晶シリコン一般値の目安0.5）
 
     Returns:
         dict: assumptions（入力エコー）/ kpis（IRR・NPV・回収年数）/
@@ -920,6 +944,7 @@ def simulate_fip_case_a(
         decommission_pct=decommission_pct, equity_ratio_pct=equity_ratio_pct,
         loan_interest_pct=loan_interest_pct, loan_years=loan_years,
         irr_period_years=irr_period_years,
+        pv_degrade_pct_per_year=pv_degrade_pct_per_year,
     )
     if not v.get("valid"):
         return {"error": "パラメータ検証エラー", "errors": v.get("errors", []),
@@ -971,6 +996,7 @@ def simulate_fip_case_b(
     fip_transition_year: int = 12,
     pv_acquisition_cost_yen: float = 0.0,
     fit_curtailment_rate_pct: float = 0.0,
+    pv_degrade_pct_per_year: float = 0.5,
 ) -> dict:
     """ケースB: 既存FIT発電所のFIP転＋蓄電池後付けの事業性を試算する（実行30〜90秒）。
 
@@ -1022,6 +1048,8 @@ def simulate_fip_case_b(
         pv_acquisition_cost_yen: PV取得価額 [円]（任意、FIT継続比較の参考用）
         fit_curtailment_rate_pct: FIT期間中の出力制御率 [%]（「FIP転しない場合」の
             比較シナリオに適用。デフォルト0=FIT優先で制御されない前提）
+        pv_degrade_pct_per_year: PV年間劣化率 [%/年]（線形、結晶シリコン一般値の目安0.5）。
+            FIP転時点のPV既経過年数（fip_transition_year-1）を劣化計算の起点に含める
 
     Returns:
         dict: assumptions / kpis（増分CFベースのIRR・NPV・回収年数）/ annual /
@@ -1059,6 +1087,7 @@ def simulate_fip_case_b(
         fip_transition_year=fip_transition_year,
         pv_acquisition_cost_yen=pv_acquisition_cost_yen,
         fit_curtailment_rate_pct=fit_curtailment_rate_pct,
+        pv_degrade_pct_per_year=pv_degrade_pct_per_year,
     )
     if not v.get("valid"):
         return {"error": "パラメータ検証エラー", "errors": v.get("errors", []),

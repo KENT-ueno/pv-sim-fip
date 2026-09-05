@@ -62,6 +62,7 @@ DEFAULT_KPA = 0.97
 DEFAULT_ETA_INO = 0.90
 DEFAULT_ALPHA = -0.35  # %/℃
 DEFAULT_DELTA_T = 21.5  # ℃（架台設置形）
+DEFAULT_PV_DEGRADE_PCT_PER_YEAR = 0.5  # PV年間劣化率 [%/年]（線形、結晶シリコン一般値）
 
 MAX_FACES = 8
 
@@ -1065,6 +1066,8 @@ def build_cashflow(
     fip_premium_years=None,
     annual_revenue_with_bat_no_premium=None,
     annual_revenue_without_bat_no_premium=None,
+    pv_degrade_pct_per_year=0.0,
+    pv_start_age_years=0,
 ):
     """20年間の年次キャッシュフローを構築する。
 
@@ -1099,6 +1102,11 @@ def build_cashflow(
         om_bat_per_kw_pcs: 蓄電池O&M [円/kW(PCS)/年]（PCS_kW建てモード時）
         bat_max_charge_kw: 蓄電池PCS定格 [kW]（PCS_kW建てモード時）
         decom_pct: 廃止措置費用 [CAPEX×%]（最終年に計上）
+        pv_degrade_pct_per_year: PV年間劣化率 [%/年]（線形）。年収益全体
+            （蓄電池アービトラージ込み）に乗算する経年劣化係数
+        pv_start_age_years: このキャッシュフローの年1が始まる時点でのPVの既経過年数。
+            ケースA（新設）は0。ケースB（既存FIT→FIP転）はFIP転時点でのPV経過年数
+            （fip_transition_year − 1）を渡し、転居前からの物理劣化を正しく反映する
 
     Returns:
         dict: 年次CFテーブル、IRR、回収年数等
@@ -1141,7 +1149,9 @@ def build_cashflow(
     arbitrage_initial_nopremium = (
         annual_revenue_with_bat_no_premium - annual_revenue_without_bat_no_premium
     )
-    # 蓄電池なし収益は劣化しない（PV発電量はKPDで吸収済み、蓄電池に依存しない）
+    # PV年間劣化（線形）: 年収益全体（ベース売電＋蓄電池アービトラージ）に乗算する。
+    # 蓄電池アービトラージ自体もPV発電量に規模が連動するため、劣化を通しで乗じる近似とする
+    # （PV劣化ごとにLPを再実行するのは計算コスト上非現実的なための簡略化）。
 
     rows = []  # 各年の {year, revenue, om, debt_service, ebitda, net_cf, project_cf, cum_project, cum_net}
 
@@ -1176,6 +1186,10 @@ def build_cashflow(
         else:
             degrade_factor = 0.0
 
+        # PVの経年劣化（線形、既経過年数を含めた実年齢で評価）
+        pv_age = pv_start_age_years + (y - 1)
+        pv_degrade_factor = max(0.0, 1.0 - pv_degrade_pct_per_year / 100.0 * pv_age)
+
         # その年の収益: フェーズに応じてプレミアム期/プレミアム終了後 を選択
         in_premium_phase = (y <= fip_premium_years)
         if in_premium_phase:
@@ -1186,9 +1200,9 @@ def build_cashflow(
             arb_init = arbitrage_initial_nopremium
 
         if bat_active:
-            year_revenue = base_rev + arb_init * degrade_factor
+            year_revenue = (base_rev + arb_init * degrade_factor) * pv_degrade_factor
         else:
-            year_revenue = base_rev
+            year_revenue = base_rev * pv_degrade_factor
 
         # 蓄電池寿命到来の処理
         bat_replace_cost = 0.0
@@ -1284,6 +1298,8 @@ def build_fit_continuation_cashflow(
     pv_capex_sunk,
     om_ratio_pct,
     fit_curtailment_rate_pct=0.0,
+    pv_degrade_pct_per_year=0.0,
+    pv_start_age_years=0,
 ):
     """ケースB比較用: 「FIP転しない（FIT継続）」シナリオの20年間CF。
 
@@ -1302,6 +1318,9 @@ def build_fit_continuation_cashflow(
         fit_curtailment_rate_pct: FIT期間中の出力制御率 [%]（CLAUDE.md §4-6）。
             デフォルト0=FIT優先で制御されない前提。年間発電量に対する単純な
             エネルギー損失率として適用（時間帯別プロファイルは持たない集計値のため）。
+        pv_degrade_pct_per_year: PV年間劣化率 [%/年]（線形）
+        pv_start_age_years: このキャッシュフローの年1が始まる時点でのPVの既経過年数
+            （FIP転せずFIT継続する場合も、その時点でのPVの実年齢を渡す）
 
     Returns:
         dict: FIT継続CF（行リストと20年累計CF）
@@ -1312,10 +1331,12 @@ def build_fit_continuation_cashflow(
     rows.append({"year": 0, "revenue": 0.0, "om": 0.0, "ebitda": 0.0, "cum": 0.0})
     cum = 0.0
     for y in range(1, irr_period_years + 1):
+        pv_age = pv_start_age_years + (y - 1)
+        pv_degrade_factor = max(0.0, 1.0 - pv_degrade_pct_per_year / 100.0 * pv_age)
         if y <= fit_remaining_years:
-            rev = annual_gen_kwh * fit_export_factor * fit_tariff  # FIT期間（出力制御反映）
+            rev = annual_gen_kwh * fit_export_factor * fit_tariff * pv_degrade_factor  # FIT期間
         else:
-            rev = annual_revenue_jepx_direct_no_premium  # FIT満了後はJEPX直売
+            rev = annual_revenue_jepx_direct_no_premium * pv_degrade_factor  # FIT満了後はJEPX直売
         ebitda = rev - pv_om
         cum += ebitda
         rows.append({
@@ -1341,6 +1362,7 @@ def build_caseb_display_rows(
     om_ratio_pct,
     bat_net_capex,
     fit_curtailment_rate_pct=0.0,
+    pv_degrade_pct_per_year=0.0,
 ):
     """ケースB（既存FIT→FIP転）のCFチャート表示用の年次行を構築する。
 
@@ -1386,7 +1408,8 @@ def build_caseb_display_rows(
 
     # --- Plant year 1..(fip_transition_year - 1): FIT phase ---
     for py in range(1, int(fip_transition_year)):
-        rev = annual_gen_kwh * fit_export_factor * float(fit_tariff)
+        pv_degrade_factor = max(0.0, 1.0 - pv_degrade_pct_per_year / 100.0 * (py - 1))
+        rev = annual_gen_kwh * fit_export_factor * float(fit_tariff) * pv_degrade_factor
         ebitda = rev - pv_om
         cum += ebitda
         cum_net += ebitda
@@ -1530,6 +1553,8 @@ def grid_search_capacity_pirr(
     fip_premium_years=None,
     annual_revenue_without_bat_no_premium=None,
     annual_export_without_bat=None,
+    pv_degrade_pct_per_year=0.0,
+    pv_start_age_years=0,
 ):
     """段階2: グリッドサーチで容量ごとの P-IRR / NPV を計算。
 
@@ -1601,6 +1626,8 @@ def grid_search_capacity_pirr(
                 fip_premium_years=fip_premium_years,
                 annual_revenue_with_bat_no_premium=opt_revenue_nopremium,
                 annual_revenue_without_bat_no_premium=annual_revenue_without_bat_no_premium,
+                pv_degrade_pct_per_year=pv_degrade_pct_per_year,
+                pv_start_age_years=pv_start_age_years,
             )
             results.append({
                 "capacity": float(cap),
@@ -1659,6 +1686,8 @@ def grid_search_capacity_pirr(
                 fip_premium_years=fip_premium_years,
                 annual_revenue_with_bat_no_premium=opt_revenue_nopremium,
                 annual_revenue_without_bat_no_premium=annual_revenue_without_bat_no_premium,
+                pv_degrade_pct_per_year=pv_degrade_pct_per_year,
+                pv_start_age_years=pv_start_age_years,
             )
             return {
                 "capacity": float(cap),
@@ -2007,6 +2036,7 @@ def run_simulation(
     fip_transition_year=12,               # FIP転を実施する年（FIT開始から数えて）
     pv_acquisition_cost=0.0,              # PV取得価額 [円]（ケースB、サンクコスト）
     fit_curtailment_rate_pct=0.0,         # FIT期間中の出力制御率 [%]（ケースB、CLAUDE.md §4-6）
+    pv_degrade_pct_per_year=DEFAULT_PV_DEGRADE_PCT_PER_YEAR,  # PV年間劣化率 [%/年]（線形）
 ):
     """メイン計算コールバック"""
     try:
@@ -2108,6 +2138,8 @@ def run_simulation(
 
         # --- ケース別パラメータ（手動/最適容量探索 共通） ---
         is_fit_to_fip = (case_type == "既存FIT→FIP転")
+        # PVの既経過年数（ケースB: FIP転時点で何年稼働済みか。ケースA: 新設のため0）
+        pv_start_age_years = int(fip_transition_year) - 1 if is_fit_to_fip else 0
         if is_fit_to_fip:
             # ケースB: FIPプレミアム期間 = FIT残存期間
             effective_premium_years = max(
@@ -2193,6 +2225,8 @@ def run_simulation(
                 decom_pct=float(decom_pct),
                 fip_premium_years=effective_premium_years,
                 annual_revenue_without_bat_no_premium=baseline_no_prem_rev,
+                pv_degrade_pct_per_year=float(pv_degrade_pct_per_year),
+                pv_start_age_years=pv_start_age_years,
             )
             # NPV最大点を採用（IRRは容量に対して単調減少しがちなので経済学的にNPVが正しい）
             best = None
@@ -2296,6 +2330,8 @@ def run_simulation(
             fip_premium_years=effective_premium_years,
             annual_revenue_with_bat_no_premium=opt_no_prem_rev,
             annual_revenue_without_bat_no_premium=baseline_no_prem_rev,
+            pv_degrade_pct_per_year=float(pv_degrade_pct_per_year),
+            pv_start_age_years=pv_start_age_years,
         )
 
         # --- ケースB: FIT継続シナリオの対比（常に計算） ---
@@ -2316,6 +2352,8 @@ def run_simulation(
                 pv_capex_sunk=float(pv_acquisition_cost),
                 om_ratio_pct=float(om_ratio_pct),
                 fit_curtailment_rate_pct=float(fit_curtailment_rate_pct),
+                pv_degrade_pct_per_year=float(pv_degrade_pct_per_year),
+                pv_start_age_years=pv_start_age_years,
             )
 
             # === 増分CFに基づくProject IRR/NPV/回収年数の再計算 ===
@@ -2343,6 +2381,7 @@ def run_simulation(
                 om_ratio_pct=float(om_ratio_pct),
                 bat_net_capex=cf_result["net_capex"],
                 fit_curtailment_rate_pct=float(fit_curtailment_rate_pct),
+                pv_degrade_pct_per_year=float(pv_degrade_pct_per_year),
             )
             cf_for_chart = dict(cf_result)
             cf_for_chart["rows"] = display_rows
@@ -2373,7 +2412,11 @@ def run_simulation(
         result_text += f"設備容量: {total_ppeak:.1f} kW（{len(faces)}面）\n"
         result_text += f"年間発電量: {result['annual']:.0f} kWh/年\n"
         result_text += f"設備利用率: {result['annual'] / (total_ppeak * 8760) * 100:.1f}%\n"
-        result_text += f"K' = {result['K_prime']:.4f}\n\n"
+        result_text += f"K' = {result['K_prime']:.4f}\n"
+        result_text += f"PV年間劣化率（線形、キャッシュフローに反映）: {float(pv_degrade_pct_per_year):.2f}%/年\n"
+        if pv_start_age_years > 0:
+            result_text += f"  FIP転時点のPV既経過年数: {pv_start_age_years}年（劣化計算の起点に反映）\n"
+        result_text += "\n"
 
         result_text += "── JEPX価格条件 ──\n"
         result_text += f"エリア: {jepx_area}\n"
@@ -2734,6 +2777,11 @@ def build_ui():
                         value=ECON_DEFAULTS["equity_ratio_pct"], precision=0,
                     )
                 with gr.Row():
+                    pv_degrade_input = gr.Number(
+                        label="PV年間劣化率 [%/年]（線形、結晶シリコン一般値）",
+                        value=DEFAULT_PV_DEGRADE_PCT_PER_YEAR, precision=2,
+                    )
+                with gr.Row():
                     bat_om_mode_input = gr.Radio(
                         label="蓄電池O&Mモード",
                         choices=BATTERY_OM_MODES,
@@ -2905,13 +2953,13 @@ def build_ui():
         N_FACE = MAX_FACES * 5  # 40
         # 追加: bat_om_mode, om_bat_pcs, decom_pct, case_type, fip_premium_years,
         #       fit_tariff, fit_term_years, fip_transition_year, pv_acquisition_cost,
-        #       fit_curtailment_rate_pct
+        #       fit_curtailment_rate_pct, pv_degrade_pct_per_year
         extra_inputs = [
             bat_om_mode_input, om_bat_pcs_input, decom_pct_input,
             case_type_input, fip_premium_years_input,
             fit_tariff_input, fit_term_years_input,
             fip_transition_year_input, pv_acquisition_cost_input,
-            fit_curtailment_rate_input,
+            fit_curtailment_rate_input, pv_degrade_input,
         ]
 
         def on_click(*args):
@@ -2924,6 +2972,7 @@ def build_ui():
             fit_tariff_v, fit_term_years_v = tail[8], tail[9]
             fip_transition_year_v, pv_acq_v = tail[10], tail[11]
             fit_curtail_v = tail[12]
+            pv_degrade_v = tail[13]
             return run_simulation(
                 *base, face_args,
                 num_faces=num_f,
@@ -2938,6 +2987,7 @@ def build_ui():
                 fip_transition_year=fip_transition_year_v,
                 pv_acquisition_cost=pv_acq_v,
                 fit_curtailment_rate_pct=fit_curtail_v,
+                pv_degrade_pct_per_year=pv_degrade_v,
             )
 
         all_inputs_with_display = all_inputs + [num_faces_input, month_input, day_input] + extra_inputs
