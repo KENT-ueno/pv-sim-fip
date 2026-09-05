@@ -63,6 +63,10 @@ DEFAULT_ETA_INO = 0.90
 DEFAULT_ALPHA = -0.35  # %/℃
 DEFAULT_DELTA_T = 21.5  # ℃（架台設置形）
 DEFAULT_PV_DEGRADE_PCT_PER_YEAR = 0.5  # PV年間劣化率 [%/年]（線形、結晶シリコン一般値）
+DEFAULT_ARBITRAGE_REALIZATION_RATE_PCT = 85.0  # 蓄電池アービトラージ実現率 [%]
+# LP最適化は1年分のJEPX価格を完全予見する前提の理論上限。実運用は前日予測ベースのため、
+# 蓄電池による増分収益（アービトラージ＋出力制御回避）はこの理論値の7〜9割程度に低下する
+# とされる（Phase 4設計書 §4 決定事項、デフォルト85%）。
 
 MAX_FACES = 8
 
@@ -1068,6 +1072,7 @@ def build_cashflow(
     annual_revenue_without_bat_no_premium=None,
     pv_degrade_pct_per_year=0.0,
     pv_start_age_years=0,
+    arbitrage_realization_rate_pct=100.0,
 ):
     """20年間の年次キャッシュフローを構築する。
 
@@ -1107,6 +1112,10 @@ def build_cashflow(
         pv_start_age_years: このキャッシュフローの年1が始まる時点でのPVの既経過年数。
             ケースA（新設）は0。ケースB（既存FIT→FIP転）はFIP転時点でのPV経過年数
             （fip_transition_year − 1）を渡し、転居前からの物理劣化を正しく反映する
+        arbitrage_realization_rate_pct: 蓄電池アービトラージ実現率 [%]（デフォルト100=無補正）。
+            LP最適化は1年分のJEPX価格を完全予見する理論上限であり、実運用（前日予測ベース）の
+            蓄電池増分収益（アービトラージ＋出力制御回避）はこれを下回るのが通常。
+            蓄電池による増分収益にのみ乗算し、ベースラインのJEPX直売収入には適用しない。
 
     Returns:
         dict: 年次CFテーブル、IRR、回収年数等
@@ -1145,10 +1154,15 @@ def build_cashflow(
 
     # === 年次キャッシュフロー構築 ===
     # 各フェーズの「蓄電池あり収益 − 蓄電池なし収益」= アービトラージ価値（劣化に応じて減少）
-    arbitrage_initial_premium = annual_revenue_with_bat - annual_revenue_without_bat
+    # LP最適化は1年分のJEPX価格を完全予見する理論上限のため、実運用の実現率で割り引く
+    # （ベースラインのJEPX直売収入には適用しない。蓄電池の増分収益にのみ効かせる）。
+    realization_factor = arbitrage_realization_rate_pct / 100.0
+    arbitrage_initial_premium = (
+        annual_revenue_with_bat - annual_revenue_without_bat
+    ) * realization_factor
     arbitrage_initial_nopremium = (
         annual_revenue_with_bat_no_premium - annual_revenue_without_bat_no_premium
-    )
+    ) * realization_factor
     # PV年間劣化（線形）: 年収益全体（ベース売電＋蓄電池アービトラージ）に乗算する。
     # 蓄電池アービトラージ自体もPV発電量に規模が連動するため、劣化を通しで乗じる近似とする
     # （PV劣化ごとにLPを再実行するのは計算コスト上非現実的なための簡略化）。
@@ -1286,6 +1300,10 @@ def build_cashflow(
         "project_npv": project_npv,
         "payback_year": payback_year,
         "avg_ebitda": avg_ebitda,
+        "arbitrage_realization_rate_pct": arbitrage_realization_rate_pct,
+        # 実現率適用前（LP理論値）/ 適用後（キャッシュフローに実際使われた値）を透明化
+        "arbitrage_value_theoretical_yen": annual_revenue_with_bat - annual_revenue_without_bat,
+        "arbitrage_value_realized_yen": arbitrage_initial_premium,
     }
 
 
@@ -1555,6 +1573,7 @@ def grid_search_capacity_pirr(
     annual_export_without_bat=None,
     pv_degrade_pct_per_year=0.0,
     pv_start_age_years=0,
+    arbitrage_realization_rate_pct=100.0,
 ):
     """段階2: グリッドサーチで容量ごとの P-IRR / NPV を計算。
 
@@ -1628,6 +1647,7 @@ def grid_search_capacity_pirr(
                 annual_revenue_without_bat_no_premium=annual_revenue_without_bat_no_premium,
                 pv_degrade_pct_per_year=pv_degrade_pct_per_year,
                 pv_start_age_years=pv_start_age_years,
+                arbitrage_realization_rate_pct=arbitrage_realization_rate_pct,
             )
             results.append({
                 "capacity": float(cap),
@@ -1688,6 +1708,7 @@ def grid_search_capacity_pirr(
                 annual_revenue_without_bat_no_premium=annual_revenue_without_bat_no_premium,
                 pv_degrade_pct_per_year=pv_degrade_pct_per_year,
                 pv_start_age_years=pv_start_age_years,
+                arbitrage_realization_rate_pct=arbitrage_realization_rate_pct,
             )
             return {
                 "capacity": float(cap),
@@ -2037,6 +2058,7 @@ def run_simulation(
     pv_acquisition_cost=0.0,              # PV取得価額 [円]（ケースB、サンクコスト）
     fit_curtailment_rate_pct=0.0,         # FIT期間中の出力制御率 [%]（ケースB、CLAUDE.md §4-6）
     pv_degrade_pct_per_year=DEFAULT_PV_DEGRADE_PCT_PER_YEAR,  # PV年間劣化率 [%/年]（線形）
+    arbitrage_realization_rate_pct=DEFAULT_ARBITRAGE_REALIZATION_RATE_PCT,  # 蓄電池アービトラージ実現率 [%]
 ):
     """メイン計算コールバック"""
     try:
@@ -2227,6 +2249,7 @@ def run_simulation(
                 annual_revenue_without_bat_no_premium=baseline_no_prem_rev,
                 pv_degrade_pct_per_year=float(pv_degrade_pct_per_year),
                 pv_start_age_years=pv_start_age_years,
+                arbitrage_realization_rate_pct=float(arbitrage_realization_rate_pct),
             )
             # NPV最大点を採用（IRRは容量に対して単調減少しがちなので経済学的にNPVが正しい）
             best = None
@@ -2332,6 +2355,7 @@ def run_simulation(
             annual_revenue_without_bat_no_premium=baseline_no_prem_rev,
             pv_degrade_pct_per_year=float(pv_degrade_pct_per_year),
             pv_start_age_years=pv_start_age_years,
+            arbitrage_realization_rate_pct=float(arbitrage_realization_rate_pct),
         )
 
         # --- ケースB: FIT継続シナリオの対比（常に計算） ---
@@ -2469,11 +2493,14 @@ def run_simulation(
         # --- 蓄電池の増分価値 ---
         revenue_diff = opt_result['annual_revenue'] - baseline['annual_revenue']
         export_diff = opt_result['annual_export'] - baseline['annual_export']
+        realization_rate = float(arbitrage_realization_rate_pct)
+        revenue_diff_realized = revenue_diff * realization_rate / 100.0
         result_text += "── 蓄電池の増分価値 ──\n"
         result_text += f"売電量増減: {export_diff:+.0f} kWh/年\n"
-        result_text += f"アービトラージ＋制御回避: {revenue_diff / 10000:+.1f} 万円/年\n"
+        result_text += f"アービトラージ＋制御回避（LP理論値、完全予見）: {revenue_diff / 10000:+.1f} 万円/年\n"
+        result_text += f"  実現率{realization_rate:.0f}%適用後（事業性計算に使用）: {revenue_diff_realized / 10000:+.1f} 万円/年\n"
         if used_capacity > 0:
-            result_text += f"単位容量あたり: {revenue_diff / used_capacity:+.0f} 円/kWh/年\n"
+            result_text += f"単位容量あたり（実現後）: {revenue_diff_realized / used_capacity:+.0f} 円/kWh/年\n"
         result_text += "\n"
 
         # --- 経済性 ---
@@ -2782,6 +2809,11 @@ def build_ui():
                         value=DEFAULT_PV_DEGRADE_PCT_PER_YEAR, precision=2,
                     )
                 with gr.Row():
+                    arbitrage_realization_input = gr.Number(
+                        label="蓄電池アービトラージ実現率 [%]（完全予見LPの理論値に対する実運用の目安）",
+                        value=DEFAULT_ARBITRAGE_REALIZATION_RATE_PCT, precision=1,
+                    )
+                with gr.Row():
                     bat_om_mode_input = gr.Radio(
                         label="蓄電池O&Mモード",
                         choices=BATTERY_OM_MODES,
@@ -2953,13 +2985,14 @@ def build_ui():
         N_FACE = MAX_FACES * 5  # 40
         # 追加: bat_om_mode, om_bat_pcs, decom_pct, case_type, fip_premium_years,
         #       fit_tariff, fit_term_years, fip_transition_year, pv_acquisition_cost,
-        #       fit_curtailment_rate_pct, pv_degrade_pct_per_year
+        #       fit_curtailment_rate_pct, pv_degrade_pct_per_year, arbitrage_realization_rate_pct
         extra_inputs = [
             bat_om_mode_input, om_bat_pcs_input, decom_pct_input,
             case_type_input, fip_premium_years_input,
             fit_tariff_input, fit_term_years_input,
             fip_transition_year_input, pv_acquisition_cost_input,
             fit_curtailment_rate_input, pv_degrade_input,
+            arbitrage_realization_input,
         ]
 
         def on_click(*args):
@@ -2973,6 +3006,7 @@ def build_ui():
             fip_transition_year_v, pv_acq_v = tail[10], tail[11]
             fit_curtail_v = tail[12]
             pv_degrade_v = tail[13]
+            arbitrage_realization_v = tail[14]
             return run_simulation(
                 *base, face_args,
                 num_faces=num_f,
@@ -2988,6 +3022,7 @@ def build_ui():
                 pv_acquisition_cost=pv_acq_v,
                 fit_curtailment_rate_pct=fit_curtail_v,
                 pv_degrade_pct_per_year=pv_degrade_v,
+                arbitrage_realization_rate_pct=arbitrage_realization_v,
             )
 
         all_inputs_with_display = all_inputs + [num_faces_input, month_input, day_input] + extra_inputs

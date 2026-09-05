@@ -197,7 +197,7 @@ Claude (エージェント) ┼─ (MCP) ─ pv-sim-gh    … 家庭用需給
 | Phase | 内容 | 完了条件 |
 |---|---|---|
 | **4a** ✅ | fip MCP化最小版: Gradio更新、`list_stations` / `get_jepx_stats` / `estimate_pv_generation` / `validate_fip_params` / `simulate_fip_case_a/b` | **完了（2026-08-31, commit f1d9bf4）**。本番Spaceで全6ツール動作確認（IRR 7.11%=ローカル一致）。UI回帰なし |
-| **4b** | ガードレール整備: 出力スキーマ統一、caveats同梱、`arbitrage_realization_rate`（UI側にも追加）、入力上限 | validate→confirm→simulateの運用が実プロンプトで機能 |
+| **4b** ✅ | ガードレール整備: 出力スキーマ統一、caveats同梱、`arbitrage_realization_rate_pct`（UI側にも追加）、入力上限 | **完了（2026-09-05）**。デフォルト85%、UI/MCP両方に実装。理論値/実現値を透明出力。`test_mcp_tools.py`で単調性・スコープ（蓄電池なし時は無効果）を検証 |
 | **4c** | 系統用蓄電池: 制度調査（託送・容量市場）→ LP実装 → `simulate_grid_battery` | ミニケースLP検証＋公表試算との突合 |
 | **4d** | 横展開: gh / biz を同パターンでMCP化（各リポジトリで実施） | 3サーバー同時接続で横断比較が動く |
 | **4e** | OSSドキュメント: MCP接続ガイド（日英）、活用例プロンプト集、READMEバッジ | 第三者がREADMEだけで接続・試算できる |

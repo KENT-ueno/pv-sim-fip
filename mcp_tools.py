@@ -49,8 +49,9 @@ _EOL_MAP = {
 }
 
 _COMMON_CAVEATS = [
-    "蓄電池運用は1年分のJEPX価格を全て既知とする完全予見LPによる理論上限であり、"
-    "実運用（前日予測ベース）の収益はこれを下回るのが通常です",
+    "蓄電池のLP最適化は1年分のJEPX価格を全て既知とする完全予見が前提の理論上限です。"
+    "実際のCF/IRR計算では arbitrage_realization_rate_pct（デフォルト85%）を乗じて"
+    "実運用（前日予測ベース）想定に補正していますが、この補正値自体も目安です",
     "JEPX価格は過去実績の平均であり、将来の市場価格を保証するものではありません",
     "本結果は投資判断の参考情報であり、収益を保証するものではありません",
 ]
@@ -118,6 +119,7 @@ def _normalize_and_validate(
     pv_acquisition_cost_yen: float,
     fit_curtailment_rate_pct: float = 0.0,
     pv_degrade_pct_per_year: float = 0.5,
+    arbitrage_realization_rate_pct: float = 85.0,
 ):
     """パラメータを正規化し (params, warnings, errors) を返す。LPは実行しない。"""
     app = _get_app()
@@ -178,6 +180,8 @@ def _normalize_and_validate(
         errors.append("annual_curtailment_rate_pct は 0〜50 で指定してください")
     if not (0 <= pv_degrade_pct_per_year <= 5):
         errors.append("pv_degrade_pct_per_year は 0〜5 で指定してください")
+    if not (0 <= arbitrage_realization_rate_pct <= 100):
+        errors.append("arbitrage_realization_rate_pct は 0〜100 で指定してください")
 
     if case == "B":
         if not (1 <= int(fip_transition_year) <= int(fit_term_years)):
@@ -280,6 +284,7 @@ def _normalize_and_validate(
         # PVの既経過年数。ケースB: FIP転時点で何年稼働済みか（fip_transition_year-1）。
         # ケースA: 新設のため0
         "pv_start_age_years": (int(fip_transition_year) - 1) if case == "B" else 0,
+        "arbitrage_realization_rate_pct": float(arbitrage_realization_rate_pct),
     }
     if case == "B":
         params.update({
@@ -414,6 +419,7 @@ def _run_fip_simulation(case: str, p: dict):
         annual_revenue_without_bat_no_premium=baseline_no_prem_rev,
         pv_degrade_pct_per_year=p.get("pv_degrade_pct_per_year", 0.0),
         pv_start_age_years=p.get("pv_start_age_years", 0),
+        arbitrage_realization_rate_pct=p.get("arbitrage_realization_rate_pct", 100.0),
     )
 
     caseb_comparison = None
@@ -518,9 +524,16 @@ def _run_fip_simulation(case: str, p: dict):
             "annual_revenue_with_battery_yen": round(opt["annual_revenue"]),
             "annual_revenue_without_battery_yen": round(baseline["annual_revenue"]),
             "battery_annual_increment_yen": round(opt["annual_revenue"] - baseline["annual_revenue"]),
+            "battery_annual_increment_theoretical_yen": round(cf_result["arbitrage_value_theoretical_yen"]),
+            "battery_annual_increment_realized_yen": round(cf_result["arbitrage_value_realized_yen"]),
+            "arbitrage_realization_rate_pct": cf_result["arbitrage_realization_rate_pct"],
             "discount_rate_note": "project_npv_yen は discount_rate_pct（借入金利をWACC近似として"
                                   "流用）で割り引いています。loan_interest_pct を変更すると、"
                                   "借入返済負担とNPV割引率の両方が連動して変わります",
+            "arbitrage_realization_note": "battery_annual_increment_theoretical_yen は1年分のJEPX価格を"
+                                          "完全予見するLPの理論上限。実際のCF/IRR計算には"
+                                          "arbitrage_realization_rate_pct を乗じた"
+                                          "battery_annual_increment_realized_yen を使用しています",
         },
         "annual": {
             "generation_kwh": round(result["annual"]),
@@ -736,6 +749,7 @@ def validate_fip_params(
     pv_acquisition_cost_yen: float = 0.0,
     fit_curtailment_rate_pct: float = 0.0,
     pv_degrade_pct_per_year: float = 0.5,
+    arbitrage_realization_rate_pct: float = 85.0,
 ) -> dict:
     """FIP事業性シミュレーションのパラメータを検証する（即答・LP実行なし）。
 
@@ -786,6 +800,10 @@ def validate_fip_params(
             比較シナリオに適用。デフォルト0=FIT優先で制御されない前提）
         pv_degrade_pct_per_year: PV年間劣化率 [%/年]（線形、結晶シリコン一般値の目安0.5）。
             ケースBはFIP転時点のPV既経過年数（fip_transition_year-1）を劣化計算の起点に含める
+        arbitrage_realization_rate_pct: 蓄電池アービトラージ実現率 [%]（デフォルト85）。
+            LP最適化は1年分のJEPX価格を完全予見する理論上限のため、実運用（前日予測ベース）
+            の蓄電池増分収益はこれを下回るのが通常。蓄電池による増分収益にのみ適用し、
+            ベースラインのJEPX直売収入には適用しない
 
     Returns:
         dict: {"valid": bool, "normalized_params": {...}, "warnings": [...], "errors": [...]}
@@ -814,7 +832,7 @@ def validate_fip_params(
             loan_interest_pct, loan_years, irr_period_years,
             fit_tariff_yen_per_kwh, fit_term_years, fip_transition_year,
             pv_acquisition_cost_yen, fit_curtailment_rate_pct,
-            pv_degrade_pct_per_year,
+            pv_degrade_pct_per_year, arbitrage_realization_rate_pct,
         )
         return {
             "valid": len(errors) == 0,
@@ -865,6 +883,7 @@ def simulate_fip_case_a(
     loan_years: int = 15,
     irr_period_years: int = 20,
     pv_degrade_pct_per_year: float = 0.5,
+    arbitrage_realization_rate_pct: float = 85.0,
 ) -> dict:
     """ケースA: 新規FIP発電所＋蓄電池の事業性を試算する（実行30〜90秒、LP最適化を含む）。
 
@@ -911,6 +930,8 @@ def simulate_fip_case_a(
         loan_years: 借入期間 [年]
         irr_period_years: IRR計算期間 [年]
         pv_degrade_pct_per_year: PV年間劣化率 [%/年]（線形、結晶シリコン一般値の目安0.5）
+        arbitrage_realization_rate_pct: 蓄電池アービトラージ実現率 [%]（デフォルト85。
+            完全予見LPの理論値を実運用想定に補正。蓄電池の増分収益にのみ適用）
 
     Returns:
         dict: assumptions（入力エコー）/ kpis（IRR・NPV・回収年数）/
@@ -945,6 +966,7 @@ def simulate_fip_case_a(
         loan_interest_pct=loan_interest_pct, loan_years=loan_years,
         irr_period_years=irr_period_years,
         pv_degrade_pct_per_year=pv_degrade_pct_per_year,
+        arbitrage_realization_rate_pct=arbitrage_realization_rate_pct,
     )
     if not v.get("valid"):
         return {"error": "パラメータ検証エラー", "errors": v.get("errors", []),
@@ -997,6 +1019,7 @@ def simulate_fip_case_b(
     pv_acquisition_cost_yen: float = 0.0,
     fit_curtailment_rate_pct: float = 0.0,
     pv_degrade_pct_per_year: float = 0.5,
+    arbitrage_realization_rate_pct: float = 85.0,
 ) -> dict:
     """ケースB: 既存FIT発電所のFIP転＋蓄電池後付けの事業性を試算する（実行30〜90秒）。
 
@@ -1050,6 +1073,8 @@ def simulate_fip_case_b(
             比較シナリオに適用。デフォルト0=FIT優先で制御されない前提）
         pv_degrade_pct_per_year: PV年間劣化率 [%/年]（線形、結晶シリコン一般値の目安0.5）。
             FIP転時点のPV既経過年数（fip_transition_year-1）を劣化計算の起点に含める
+        arbitrage_realization_rate_pct: 蓄電池アービトラージ実現率 [%]（デフォルト85。
+            完全予見LPの理論値を実運用想定に補正。蓄電池の増分収益にのみ適用）
 
     Returns:
         dict: assumptions / kpis（増分CFベースのIRR・NPV・回収年数）/ annual /
@@ -1088,6 +1113,7 @@ def simulate_fip_case_b(
         pv_acquisition_cost_yen=pv_acquisition_cost_yen,
         fit_curtailment_rate_pct=fit_curtailment_rate_pct,
         pv_degrade_pct_per_year=pv_degrade_pct_per_year,
+        arbitrage_realization_rate_pct=arbitrage_realization_rate_pct,
     )
     if not v.get("valid"):
         return {"error": "パラメータ検証エラー", "errors": v.get("errors", []),
