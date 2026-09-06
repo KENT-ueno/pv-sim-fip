@@ -211,7 +211,7 @@ LP自体の複雑さはむしろ縮小している（決定変数3種→3種だ�
   - **4d-2（e4efb1f）**: 両面パネル（bifacial/gcr/panel_height_m/pitch_m/積雪アルベド自動切替）とマイクログリッド事業（モードB。自営線費用・束ねメリット・網内売電収入・P-IRR。モードBはP-IRRをそのまま開示——モードA/PPAとは公開方針が異なる点に注意）を追加。app.run_simulationの直接呼び出し結果と1件単位で完全一致することを検証（`test_mcp_tools.py`に16項目追加、既存回帰テスト全PASS）。
   - 未対応: 最適容量探索（2〜3分かかるグリッドサーチ）はcaveatsに明記のうえ引き続き対象外。
   - ローカル全テストPASS・HTTP経由でローカル/本番結果が完全一致・ブラウザUI回帰なし・Codex経由の本番検証でも完全一致（4d-1部分。詳細は本節末尾）。3サーバー（fip/gh/biz）同時接続での横断比較は今後の課題 |
-| **4e** 🔶 | OSSドキュメント: MCP接続ガイド（日英）、活用例プロンプト集、READMEバッジ | **fip/gh 完了（2026-09-06, commit c86b706/1960821）**。`docs/mcp_guide.md`（3サーバー共通、接続手順・validate→確認→simulateプロトコル解説、日英併記）と`docs/example_prompts.md`（単体5例＋サーバー横断1例、全て実測値付き）をpv-sim-fipに新設。fip/ghのREADMEにMCPバッジ・接続セクションを追加（gh・biz分は各サーバーのREADMEから共通ガイドにリンクする構成）。biz分はbiz側セッションに引き継ぎ用メモ（`pv-sim-biz/MCP_README_HANDOFF.md`）を設置、**biz側のREADME反映は未確認** |
+| **4e** ✅ | OSSドキュメント: MCP接続ガイド（日英）、活用例プロンプト集、READMEバッジ | **完了（2026-09-06）**。`docs/mcp_guide.md`（3サーバー共通、接続手順・validate→確認→simulateプロトコル解説、日英併記）と`docs/example_prompts.md`（単体5例＋サーバー横断1例、全て実測値付き）をpv-sim-fipに新設（commit c86b706）。fip（c86b706）・gh（1960821）・biz（328aca1、biz側セッションで対応）の全READMEにMCPバッジ・接続セクションを追加。3Space全てで本番schemaエンドポイントの生存確認済み |
 
 各Phaseは独立してデプロイ可能。4aで価値検証してから先へ進む。
 
