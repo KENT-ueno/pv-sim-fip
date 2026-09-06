@@ -683,6 +683,7 @@ def _normalize_and_validate_grid_battery(
     wheeling_fee_yen_per_kwh: float,
     capacity_market_price_yen_per_kw_year: float,
     arbitrage_realization_rate_pct: float,
+    degrade_baseline_cycles_per_year: float = 365.0,
 ):
     """系統用蓄電池（PVなし）パラメータを正規化し (params, warnings, errors) を返す。LPは実行しない。"""
     app = _get_app()
@@ -719,6 +720,8 @@ def _normalize_and_validate_grid_battery(
         errors.append("wheeling_fee_yen_per_kwh は0以上で指定してください")
     if capacity_market_price_yen_per_kw_year < 0:
         errors.append("capacity_market_price_yen_per_kw_year は0以上で指定してください")
+    if not (0 < degrade_baseline_cycles_per_year <= 3650):
+        errors.append("degrade_baseline_cycles_per_year は 0 < x <= 3650 で指定してください")
 
     if 2022 in years:
         warnings.append("2022年度はウクライナ危機による価格高騰年です（結果が楽観側に振れます）")
@@ -731,6 +734,13 @@ def _normalize_and_validate_grid_battery(
         warnings.append("wheeling_fee_yen_per_kwh が0円です（託送料金を考慮しない楽観的な試算になります）")
     if capacity_market_price_yen_per_kw_year == 0.0:
         warnings.append("capacity_market_price_yen_per_kw_year が0円です（容量市場収益を含まない試算になります）")
+    # om_ratio_pct_per_year は本モジュールでは常に未使用（battery_om_modeがPCS_kW建てに固定のため）。
+    # 2026-09-06のMCP実測レビューで「設定できるのに効かないパラメータ」と指摘された対応
+    if om_ratio_pct_per_year != 1.5:
+        warnings.append(
+            "om_ratio_pct_per_year は現在このモジュールでは使用されません"
+            "（O&Mは常に battery_om_yen_per_kw_pcs_per_year × 定格出力で計算されます）"
+        )
 
     params = {
         "jepx_area": jepx_area,
@@ -759,6 +769,7 @@ def _normalize_and_validate_grid_battery(
         "wheeling_fee_yen_per_kwh": float(wheeling_fee_yen_per_kwh),
         "capacity_market_price_yen_per_kw_year": float(capacity_market_price_yen_per_kw_year),
         "arbitrage_realization_rate_pct": float(arbitrage_realization_rate_pct),
+        "degrade_baseline_cycles_per_year": float(degrade_baseline_cycles_per_year),
     }
     return params, warnings, errors
 
@@ -803,6 +814,8 @@ def _run_grid_battery_simulation(p: dict):
         bat_max_charge_kw=p["battery_max_charge_kw"],
         decom_pct=p["decommission_pct"],
         arbitrage_realization_rate_pct=p.get("arbitrage_realization_rate_pct", 100.0),
+        annual_equivalent_cycles=opt["equivalent_full_cycles_usable_soc"],
+        degrade_baseline_cycles_per_year=p.get("degrade_baseline_cycles_per_year", 365.0),
     )
 
     cashflow_rows = []
@@ -833,6 +846,12 @@ def _run_grid_battery_simulation(p: dict):
         "「対象外」と明示する方針としています（このツールはスポット市場のみが対象です）",
         "JEPX価格は過去実績の平均であり、将来の市場価格を保証するものではありません",
         "本結果は投資判断の参考情報であり、収益を保証するものではありません",
+        f"蓄電池劣化率は degrade_baseline_cycles_per_year={p.get('degrade_baseline_cycles_per_year', 365.0):.0f}回/年"
+        "（デフォルト365=三菱総研試算の「1回/日」前提）を基準に、実際の年間等価フルサイクル数"
+        f"（{cf_result['annual_equivalent_cycles']:.1f}回、SOC使用幅基準）との比率でスケールしています。"
+        f"battery_degrade_pct_per_year（入力{cf_result['bat_degrade_pct_per_year_input']:.2f}%/年）に"
+        f"cycle_intensity_ratio={cf_result['cycle_intensity_ratio']:.2f}を乗じた"
+        f"実効劣化率{cf_result['effective_bat_degrade_pct_per_year']:.2f}%/年をキャッシュフローに使用しています",
     ]
     if p["wheeling_fee_yen_per_kwh"] == 0.0:
         caveats.append("wheeling_fee_yen_per_kwh=0円のため託送料金を考慮していません（収益が過大評価されます）")
@@ -851,11 +870,16 @@ def _run_grid_battery_simulation(p: dict):
             "annual_arbitrage_revenue_realized_yen": round(cf_result["arbitrage_value_realized_yen"]),
             "annual_capacity_market_revenue_yen": round(capacity_market_revenue),
             "arbitrage_realization_rate_pct": cf_result["arbitrage_realization_rate_pct"],
+            "cycle_intensity_ratio": round(cf_result["cycle_intensity_ratio"], 2),
+            "effective_bat_degrade_pct_per_year": round(cf_result["effective_bat_degrade_pct_per_year"], 2),
         },
         "annual": {
             "battery_charge_kwh": round(opt["annual_charge_kwh"]),
             "battery_discharge_kwh": round(opt["annual_discharge_kwh"]),
-            "equivalent_full_cycles": round(opt["equivalent_full_cycles"], 1),
+            "equivalent_full_cycles_nameplate": round(opt["equivalent_full_cycles_nameplate"], 1),
+            "equivalent_full_cycles_usable_soc": round(opt["equivalent_full_cycles_usable_soc"], 1),
+            "cycle_basis_note": "nameplateは放電量÷定格容量、usable_socは放電量÷実使用可能容量"
+                                "（SOC上下限の幅）で算出。劣化率のサイクル補正にはusable_socを使用しています",
         },
         "cashflow": cashflow_rows,
         "caveats": caveats,
@@ -1361,6 +1385,7 @@ def validate_grid_battery_params(
     wheeling_fee_yen_per_kwh: float = 0.0,
     capacity_market_price_yen_per_kw_year: float = 0.0,
     arbitrage_realization_rate_pct: float = 85.0,
+    degrade_baseline_cycles_per_year: float = 365.0,
 ) -> dict:
     """太陽光を伴わない系統用蓄電池単独事業のパラメータを検証する（即答・LP実行なし）。
 
@@ -1407,7 +1432,16 @@ def validate_grid_battery_params(
             （battery_max_discharge_kw に乗じて年間収益を算定。デフォルト0=容量市場収益を
             含まない試算。実勢価格はOCCTOの容量市場約定結果を参照）
         arbitrage_realization_rate_pct: 蓄電池アービトラージ実現率 [%]（デフォルト85。
-            完全予見LPの理論値を実運用（前日予測ベース）想定に補正）
+            完全予見LPの理論値を実運用（前日予測ベース）想定に補正）。
+            ※このデフォルト値はPhase 4bでPV併設ケース向けに決定した値の転用であり、
+            系統用蓄電池単独（アービトラージ100%が価格予測精度に依存する）への妥当性は
+            未検証（2026-09-06のMCP実測レビュー指摘）
+        degrade_baseline_cycles_per_year: battery_degrade_pct_per_year の前提サイクル数
+            [回/年]（デフォルト365=1回/日。三菱総研試算の算定諸元に基づく）。実際の年間
+            等価フルサイクル数（LP結果、SOC使用幅基準）とこの値の比率で劣化率をスケールする。
+            系統用蓄電池は完全予見LPの下で1日1回を大きく超える頻度で充放電することが多く
+            （実測例: 九州で年515回＝1日1.76回）、その場合は入力した年間劣化率より速く
+            劣化する前提になる（2026-09-06のMCP実測レビュー指摘への対応）
 
     Returns:
         dict: {"valid": bool, "normalized_params": {...}, "warnings": [...], "errors": [...]}
@@ -1425,7 +1459,7 @@ def validate_grid_battery_params(
             decommission_pct, equity_ratio_pct,
             loan_interest_pct, loan_years, irr_period_years,
             wheeling_fee_yen_per_kwh, capacity_market_price_yen_per_kw_year,
-            arbitrage_realization_rate_pct,
+            arbitrage_realization_rate_pct, degrade_baseline_cycles_per_year,
         )
         return {
             "valid": len(errors) == 0,
@@ -1466,6 +1500,7 @@ def simulate_grid_battery(
     wheeling_fee_yen_per_kwh: float = 0.0,
     capacity_market_price_yen_per_kw_year: float = 0.0,
     arbitrage_realization_rate_pct: float = 85.0,
+    degrade_baseline_cycles_per_year: float = 365.0,
 ) -> dict:
     """太陽光を伴わない系統用蓄電池単独の事業性を試算する（実行10〜30秒、LP最適化を含む）。
 
@@ -1501,11 +1536,16 @@ def simulate_grid_battery(
         irr_period_years: IRR計算期間 [年]
         wheeling_fee_yen_per_kwh: 託送料金 [円/kWh]（充放電の往復に対称適用する近似）
         capacity_market_price_yen_per_kw_year: 容量市場単価 [円/kW/年]
-        arbitrage_realization_rate_pct: 蓄電池アービトラージ実現率 [%]（デフォルト85）
+        arbitrage_realization_rate_pct: 蓄電池アービトラージ実現率 [%]（デフォルト85。
+            PV併設ケース向けに決めた値の転用であり、系統用単独への妥当性は未検証）
+        degrade_baseline_cycles_per_year: battery_degrade_pct_per_year の前提サイクル数
+            [回/年]（デフォルト365=1回/日）。実際の年間サイクル数との比率で劣化率を
+            スケールする（詳細は validate_grid_battery_params 参照）
 
     Returns:
-        dict: assumptions（入力エコー）/ kpis（IRR・NPV・回収年数・アービトラージ内訳）/
-              annual（充放電量・稼働サイクル数）/ cashflow（年次CF）/ caveats（免責事項）
+        dict: assumptions（入力エコー）/ kpis（IRR・NPV・回収年数・アービトラージ内訳・
+              サイクル強度による劣化率補正）/ annual（充放電量・2種類の等価フルサイクル数）/
+              cashflow（年次CF）/ caveats（免責事項）
     """
     v = validate_grid_battery_params(
         jepx_area=jepx_area, jepx_fiscal_years=jepx_fiscal_years,
@@ -1530,6 +1570,7 @@ def simulate_grid_battery(
         wheeling_fee_yen_per_kwh=wheeling_fee_yen_per_kwh,
         capacity_market_price_yen_per_kw_year=capacity_market_price_yen_per_kw_year,
         arbitrage_realization_rate_pct=arbitrage_realization_rate_pct,
+        degrade_baseline_cycles_per_year=degrade_baseline_cycles_per_year,
     )
     if not v.get("valid"):
         return {"error": "パラメータ検証エラー", "errors": v.get("errors", []),

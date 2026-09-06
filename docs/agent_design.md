@@ -205,7 +205,7 @@ LP自体の複雑さはむしろ縮小している（決定変数3種→3種だ�
 |---|---|---|
 | **4a** ✅ | fip MCP化最小版: Gradio更新、`list_stations` / `get_jepx_stats` / `estimate_pv_generation` / `validate_fip_params` / `simulate_fip_case_a/b` | **完了（2026-08-31, commit f1d9bf4）**。本番Spaceで全6ツール動作確認（IRR 7.11%=ローカル一致）。UI回帰なし |
 | **4b** ✅ | ガードレール整備: 出力スキーマ統一、caveats同梱、`arbitrage_realization_rate_pct`（UI側にも追加）、入力上限 | **完了（2026-09-05）**。デフォルト85%、UI/MCP両方に実装。理論値/実現値を透明出力。`test_mcp_tools.py`で単調性・スコープ（蓄電池なし時は無効果）を検証 |
-| **4c** ✅ | 系統用蓄電池: 制度調査（託送・容量市場）→ LP実装 → `simulate_grid_battery` | **完了（2026-09-06）**。`optimize_grid_battery`/`build_cashflow_grid_battery`（app.py）＋`validate_grid_battery_params`/`simulate_grid_battery`（mcp_tools.py）実装。`test_mcp_tools.py`で正常系・異常系・パラメータ効果を検証、全PASS。公表試算との突合は未実施（突合先データ未特定） |
+| **4c** ✅ | 系統用蓄電池: 制度調査（託送・容量市場）→ LP実装 → `simulate_grid_battery` | **完了（2026-09-06）**。`optimize_grid_battery`/`build_cashflow_grid_battery`（app.py）＋`validate_grid_battery_params`/`simulate_grid_battery`（mcp_tools.py）実装。`test_mcp_tools.py`で正常系・異常系・パラメータ効果を検証、全PASS。**同日、別セッション（Opus経由）によるMCP実測レビューを受けて5件対応**（バグなし、うち劣化率のサイクル数依存化は仕様変更として実装、他は出力表現の明確化・記録。詳細はCLAUDE.md参照）。公表試算との突合は未実施（突合先データ未特定） |
 | **4d** | 横展開: gh / biz を同パターンでMCP化（各リポジトリで実施） | 3サーバー同時接続で横断比較が動く |
 | **4e** | OSSドキュメント: MCP接続ガイド（日英）、活用例プロンプト集、READMEバッジ | 第三者がREADMEだけで接続・試算できる |
 
@@ -339,6 +339,17 @@ Codexが正しく提示し、ユーザーの明示確認を経てから本計算
 - [x] FIPプレミアムは系統用蓄電池モジュールには実装しない（発電を伴わない設備はFIP認定
       対象外という制度理解に基づく、当初設計案からの修正）
 
+### 決定済み（2026-09-06、MCP実測レビュー対応時）
+- [x] 蓄電池劣化率をカレンダー年数のみでなく実際のサイクル数でスケールする
+      （`degrade_baseline_cycles_per_year`、デフォルト365=MRI前提の1回/日）。
+      系統用蓄電池モジュール（`build_cashflow_grid_battery`）のみに適用し、PV併設ケースの
+      蓄電池劣化モデルはカレンダー依存のまま据え置き（スコープ外、実際のサイクル強度の
+      乖離が未検証のため）
+- [x] `arbitrage_realization_rate_pct`デフォルト85%は変更しない。PV併設ケース向けの値の
+      転用であり系統用への妥当性は未検証という事実をdocstring/CLAUDE.mdに記録するに留める
+
 ### 未確定（今後の課題）
 - [ ] 系統用蓄電池単独の公表試算（経産省・OCCTOの容量市場/需給調整市場資料等）との突合。
       MRI資料はPV+蓄電池の突合には使えたが、系統用蓄電池単独の公開試算は未特定
+- [ ] `arbitrage_realization_rate_pct`の系統用蓄電池への適正値の検証（現状85%はPV併設
+      ケース由来の転用値）

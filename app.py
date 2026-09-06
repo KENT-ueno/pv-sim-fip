@@ -1040,7 +1040,12 @@ def optimize_grid_battery(jepx_prices, capacity_kwh, max_charge_kw, max_discharg
     annual_charge = float(np.sum(charge_vals))
     annual_discharge = float(np.sum(discharge_vals))
     annual_revenue = float(pulp.value(prob.objective))
-    equivalent_cycles = annual_discharge / capacity_kwh if capacity_kwh > 0 else 0.0
+    # 等価フルサイクル数は2通りの慣行があり紛らわしいため両方を返す（2026-09-06、MCP実測レビュー指摘）。
+    # - nameplate: 放電量 ÷ 定格容量（銘板値基準）
+    # - usable_soc: 放電量 ÷ 実使用可能容量（SOC上下限の幅、= サイクル寿命規格でよく使われる基準）
+    usable_capacity_kwh = capacity_kwh * (soc_max_pct - soc_min_pct) / 100.0
+    equivalent_cycles_nameplate = annual_discharge / capacity_kwh if capacity_kwh > 0 else 0.0
+    equivalent_cycles_usable = annual_discharge / usable_capacity_kwh if usable_capacity_kwh > 0 else 0.0
 
     return {
         "battery_charge": charge_vals,
@@ -1049,7 +1054,8 @@ def optimize_grid_battery(jepx_prices, capacity_kwh, max_charge_kw, max_discharg
         "annual_charge_kwh": annual_charge,
         "annual_discharge_kwh": annual_discharge,
         "annual_arbitrage_revenue_yen": annual_revenue,
-        "equivalent_full_cycles": equivalent_cycles,
+        "equivalent_full_cycles_nameplate": equivalent_cycles_nameplate,
+        "equivalent_full_cycles_usable_soc": equivalent_cycles_usable,
         "battery_capacity_kwh": capacity_kwh,
     }
 
@@ -1066,6 +1072,8 @@ def build_cashflow_grid_battery(
     bat_max_charge_kw=0.0,
     decom_pct=0.0,
     arbitrage_realization_rate_pct=100.0,
+    annual_equivalent_cycles=None,
+    degrade_baseline_cycles_per_year=365.0,
 ):
     """系統用蓄電池単独（PVなし）の年次キャッシュフローを構築する。
 
@@ -1075,12 +1083,26 @@ def build_cashflow_grid_battery(
         - 容量市場収益は kW価値（供出力）に対する対価のため、蓄電池のエネルギー容量劣化
           （degrade_factor）とは連動させず、蓄電池が有効な間は満額とする近似
           （PCS自体の出力能力はエネルギー容量劣化とは別軸で管理されるため）
+        - 劣化率はサイクル数で補正する（2026-09-06、MCP実測レビュー指摘への対応）。
+          `bat_degrade_pct_per_year`（既存デフォルト1%/年）はMRI試算諸元の
+          「1回/日サイクル・20年で容量80%まで劣化」という前提に基づく値であり、
+          カレンダー年数のみに依存する。しかし系統用蓄電池は完全予見LPの下で
+          1日1回を大きく超える頻度で充放電する（実測: 九州で年515回＝1日1.76回）ため、
+          この値をそのまま年数倍するだけでは劣化が過小評価（＝収益が過大評価）される。
+          `annual_equivalent_cycles`（実際の年間等価フルサイクル数、SOC使用幅基準）を
+          `degrade_baseline_cycles_per_year`（劣化率の前提サイクル数、デフォルト365=
+          MRIの「1回/日」）に対する比率でスケールし、実際の稼働強度を反映する。
 
     Args:
         bat_capex, subsidy_bat: 蓄電池投資額・補助金 [円]
         annual_arbitrage_revenue: LP理論値の年間アービトラージ収益 [円/年]（劣化前・実現率補正前）
         capacity_market_revenue_yen_per_year: 容量市場収益 [円/年]（固定入力）
         arbitrage_realization_rate_pct: 蓄電池アービトラージ実現率 [%]（デフォルト100=無補正）
+        annual_equivalent_cycles: 実際の年間等価フルサイクル数（SOC使用幅基準、LP結果から算出）。
+            Noneの場合はサイクル補正を行わない（cycle_intensity_ratio=1.0、従来のカレンダー
+            劣化のみの挙動）
+        degrade_baseline_cycles_per_year: bat_degrade_pct_per_year の前提サイクル数
+            [回/年]（デフォルト365=1回/日。三菱総研試算の算定諸元に基づく）
         その他は build_cashflow と同じ意味
     """
     total_capex_gross = bat_capex
@@ -1102,6 +1124,13 @@ def build_cashflow_grid_battery(
     realization_factor = arbitrage_realization_rate_pct / 100.0
     arbitrage_initial = annual_arbitrage_revenue * realization_factor
 
+    # サイクル強度による劣化率の補正（実際の稼働強度が前提より高ければ劣化を加速する）
+    if annual_equivalent_cycles is not None and degrade_baseline_cycles_per_year > 0:
+        cycle_intensity_ratio = annual_equivalent_cycles / degrade_baseline_cycles_per_year
+    else:
+        cycle_intensity_ratio = 1.0
+    effective_bat_degrade_pct_per_year = bat_degrade_pct_per_year * cycle_intensity_ratio
+
     rows = []
     project_cf_0 = -net_capex
     equity_cf_0 = -equity
@@ -1121,7 +1150,7 @@ def build_cashflow_grid_battery(
     for y in range(1, irr_period_years + 1):
         if bat_active:
             life_used = (y - 1) % bat_life_years
-            degrade_factor = max(0.0, 1.0 - bat_degrade_pct_per_year / 100.0 * life_used)
+            degrade_factor = max(0.0, 1.0 - effective_bat_degrade_pct_per_year / 100.0 * life_used)
             year_revenue = arbitrage_initial * degrade_factor + capacity_market_revenue_yen_per_year
         else:
             degrade_factor = 0.0
@@ -1185,6 +1214,11 @@ def build_cashflow_grid_battery(
         "arbitrage_realization_rate_pct": arbitrage_realization_rate_pct,
         "arbitrage_value_theoretical_yen": annual_arbitrage_revenue,
         "arbitrage_value_realized_yen": arbitrage_initial,
+        "annual_equivalent_cycles": annual_equivalent_cycles,
+        "degrade_baseline_cycles_per_year": degrade_baseline_cycles_per_year,
+        "cycle_intensity_ratio": cycle_intensity_ratio,
+        "bat_degrade_pct_per_year_input": bat_degrade_pct_per_year,
+        "effective_bat_degrade_pct_per_year": effective_bat_degrade_pct_per_year,
     }
 
 
