@@ -1074,6 +1074,12 @@ def build_cashflow_grid_battery(
     arbitrage_realization_rate_pct=100.0,
     annual_equivalent_cycles=None,
     degrade_baseline_cycles_per_year=365.0,
+    property_tax_rate_pct=0.0,
+    property_tax_residual_ratio_pct=5.0,
+    annual_energy_loss_kwh=0.0,
+    renewable_energy_levy_yen_per_kwh=0.0,
+    generator_side_wheeling_cost_yen_per_year=0.0,
+    wheeling_kw_cost_yen_per_year=0.0,
 ):
     """系統用蓄電池単独（PVなし）の年次キャッシュフローを構築する。
 
@@ -1103,6 +1109,23 @@ def build_cashflow_grid_battery(
             劣化のみの挙動）
         degrade_baseline_cycles_per_year: bat_degrade_pct_per_year の前提サイクル数
             [回/年]（デフォルト365=1回/日。三菱総研試算の算定諸元に基づく）
+        property_tax_rate_pct: 固定資産税率 [%/年]（デフォルト0=未考慮。標準税率1.4%。
+            2026-09-06のMRI p.36突合レビューで追加。build_cashflowと同じ簿価逓減方式で、
+            蓄電池のみ`bat_life_years`を耐用年数として評価）
+        property_tax_residual_ratio_pct: 固定資産税評価上の残存価額下限 [取得価額に対する%]
+            （デフォルト5%）
+        annual_energy_loss_kwh: 年間の充放電ロス量 [kWh]（充電量−放電量、LP結果から算出）。
+            再エネ賦課金の課税対象として使用（MRI p.38「充放電ロス分に考慮」の解釈を踏襲）。
+            蓄電池の劣化に応じてスケールする（degrade_factorを乗算）
+        renewable_energy_levy_yen_per_kwh: 再エネ賦課金 [円/kWh]（デフォルト0=未考慮）。
+            系統から充電する以上、需要家として賦課金がかかる（PV併設蓄電池には発生しない
+            系統用蓄電池固有の費用のため、build_cashflowには存在しない）
+        generator_side_wheeling_cost_yen_per_year: 発電側課金 [円/年、固定]（デフォルト0）。
+            PCS出力(kW)に基づく年額をmcp_tools側で事前計算して渡す（kWh課金分は
+            MRI試算に倣い考慮しない）
+        wheeling_kw_cost_yen_per_year: 託送料金のkW建て（基本料金相当）[円/年、固定]
+            （デフォルト0）。既存のwheeling_fee_yen_per_kwh（LP内でkWh従量分に適用済み）
+            とは別建てで、PCS容量に基づく年額をmcp_tools側で事前計算して渡す
         その他は build_cashflow と同じ意味
     """
     total_capex_gross = bat_capex
@@ -1170,7 +1193,29 @@ def build_cashflow_grid_battery(
         if y == irr_period_years and decom_pct > 0:
             decom_cost = total_capex_gross * (decom_pct / 100.0)
 
-        ebitda = year_revenue - year_om
+        # 固定資産税（簿価逓減方式、MRI p.36突合レビューで追加。蓄電池のみ）
+        year_property_tax = 0.0
+        if bat_active and property_tax_rate_pct > 0:
+            bat_book = calc_property_tax_book_value(
+                bat_capex, bat_life_years, life_used, property_tax_residual_ratio_pct)
+            year_property_tax = bat_book * property_tax_rate_pct / 100.0
+
+        # kW建て固定費（発電側課金・託送kW建て）: 蓄電池の稼働状態にのみ連動し、
+        # エネルギー劣化(degrade_factor)には連動しない（PCS出力能力ベースの費用のため）
+        year_generator_wheeling_cost = generator_side_wheeling_cost_yen_per_year if bat_active else 0.0
+        year_wheeling_kw_cost = wheeling_kw_cost_yen_per_year if bat_active else 0.0
+
+        # 再エネ賦課金: 充放電ロス量(kWh)に比例。劣化に応じてスループットも減るため
+        # degrade_factorを乗算する（アービトラージ収益の劣化スケーリングと整合させる）
+        year_renewable_levy = (
+            renewable_energy_levy_yen_per_kwh * annual_energy_loss_kwh * degrade_factor
+            if bat_active else 0.0
+        )
+
+        ebitda = (
+            year_revenue - year_om - year_property_tax
+            - year_generator_wheeling_cost - year_wheeling_kw_cost - year_renewable_levy
+        )
         project_cf = ebitda - bat_replace_cost - decom_cost
         net_cf = project_cf - year_debt_service
 
@@ -1179,6 +1224,10 @@ def build_cashflow_grid_battery(
 
         rows.append({
             "year": y, "revenue": year_revenue, "om": year_om,
+            "property_tax": year_property_tax,
+            "generator_wheeling_cost": year_generator_wheeling_cost,
+            "wheeling_kw_cost": year_wheeling_kw_cost,
+            "renewable_levy": year_renewable_levy,
             "debt_service": year_debt_service, "battery_replace": bat_replace_cost,
             "decom_cost": decom_cost, "ebitda": ebitda,
             "net_cf": net_cf, "project_cf": project_cf,
@@ -1328,6 +1377,42 @@ def calc_npv(cashflows, discount_rate_pct):
     return sum(cf / (1 + r) ** t for t, cf in enumerate(cashflows))
 
 
+# PV設備の法定耐用年数（固定資産税の簿価計算に使用。CLAUDE.md §3で既定済みの事実値）
+PV_PROPERTY_TAX_USEFUL_LIFE_YEARS = 17.0
+
+
+def calc_property_tax_book_value(capex, useful_life_years, age, residual_ratio_pct=5.0):
+    """固定資産税（償却資産税）評価上の簿価を簿価逓減方式で計算する（2026-09-06追加）。
+
+    地方税法の標準的な考え方（初年度は半年分の減価、以降は前年簿価×(1−r)で逓減、
+    残存価額は取得価額の一定割合＝最低限度額で下限）を近似したモデル。
+    r = 2/useful_life_years（定率法に準じた減価率の簡易近似。総務省の耐用年数別
+    減価残存率表の正確な値ではないため、実際の税額とは乖離しうる近似値）。
+
+    Args:
+        capex: 取得価額 [円]
+        useful_life_years: 減価に用いる耐用年数 [年]
+        age: 資産の経過年数（0始まり。0年目=取得年度の翌年度相当）
+        residual_ratio_pct: 残存価額の下限 [取得価額に対する%]（デフォルト5%、
+            固定資産税評価の一般的な最低限度額）
+
+    Returns:
+        float: 指定年齢時点の簿価 [円]
+    """
+    if capex <= 0 or useful_life_years <= 0:
+        return 0.0
+    r = 2.0 / useful_life_years
+    residual = capex * residual_ratio_pct / 100.0
+    book = capex
+    for a in range(int(age) + 1):
+        if a == 0:
+            book = capex * (1.0 - r / 2.0)
+        else:
+            book = book * (1.0 - r)
+        book = max(book, residual)
+    return book
+
+
 def build_cashflow(
     pv_capex, bat_capex, subsidy_pv, subsidy_bat,
     annual_revenue_with_bat, annual_revenue_without_bat,
@@ -1345,6 +1430,8 @@ def build_cashflow(
     pv_degrade_pct_per_year=0.0,
     pv_start_age_years=0,
     arbitrage_realization_rate_pct=100.0,
+    property_tax_rate_pct=0.0,
+    property_tax_residual_ratio_pct=5.0,
 ):
     """20年間の年次キャッシュフローを構築する。
 
@@ -1388,6 +1475,14 @@ def build_cashflow(
             LP最適化は1年分のJEPX価格を完全予見する理論上限であり、実運用（前日予測ベース）の
             蓄電池増分収益（アービトラージ＋出力制御回避）はこれを下回るのが通常。
             蓄電池による増分収益にのみ乗算し、ベースラインのJEPX直売収入には適用しない。
+        property_tax_rate_pct: 固定資産税率 [%/年]（デフォルト0=未考慮。標準税率は1.4%、
+            2026-09-06のMCP実測レビュー指摘で追加）。PVは法定耐用年数17年
+            （`PV_PROPERTY_TAX_USEFUL_LIFE_YEARS`）、蓄電池は`bat_life_years`を
+            それぞれ簿価逓減の耐用年数として`calc_property_tax_book_value`で評価する
+            （ケースBでpv_capex=0の場合はPV分の税額も0になり、既存のPV O&M同様
+            増分CFの計算上は自然にキャンセルされる）
+        property_tax_residual_ratio_pct: 固定資産税評価上の残存価額下限 [取得価額に対する%]
+            （デフォルト5%、一般的な最低限度額）
 
     Returns:
         dict: 年次CFテーブル、IRR、回収年数等
@@ -1515,8 +1610,22 @@ def build_cashflow(
         if y == irr_period_years and decom_pct > 0:
             decom_cost = total_capex_gross * (decom_pct / 100.0)
 
-        # EBITDA = 収益 − O&M
-        ebitda = year_revenue - year_om
+        # 固定資産税（簿価逓減方式、2026-09-06追加）
+        year_property_tax = 0.0
+        if property_tax_rate_pct > 0:
+            if pv_capex > 0:
+                pv_book = calc_property_tax_book_value(
+                    pv_capex, PV_PROPERTY_TAX_USEFUL_LIFE_YEARS, pv_age,
+                    property_tax_residual_ratio_pct)
+                year_property_tax += pv_book * property_tax_rate_pct / 100.0
+            if bat_active:
+                bat_book = calc_property_tax_book_value(
+                    bat_capex, bat_life_years, life_used,
+                    property_tax_residual_ratio_pct)
+                year_property_tax += bat_book * property_tax_rate_pct / 100.0
+
+        # EBITDA = 収益 − O&M − 固定資産税
+        ebitda = year_revenue - year_om - year_property_tax
 
         # Project CF (無借入) = EBITDA − 蓄電池交換投資 − 廃止措置費用
         project_cf = ebitda - bat_replace_cost - decom_cost
@@ -1530,6 +1639,7 @@ def build_cashflow(
             "year": y,
             "revenue": year_revenue,
             "om": year_om,
+            "property_tax": year_property_tax,
             "debt_service": year_debt_service,
             "battery_replace": bat_replace_cost,
             "decom_cost": decom_cost,

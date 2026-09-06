@@ -205,7 +205,7 @@ LP自体の複雑さはむしろ縮小している（決定変数3種→3種だ�
 |---|---|---|
 | **4a** ✅ | fip MCP化最小版: Gradio更新、`list_stations` / `get_jepx_stats` / `estimate_pv_generation` / `validate_fip_params` / `simulate_fip_case_a/b` | **完了（2026-08-31, commit f1d9bf4）**。本番Spaceで全6ツール動作確認（IRR 7.11%=ローカル一致）。UI回帰なし |
 | **4b** ✅ | ガードレール整備: 出力スキーマ統一、caveats同梱、`arbitrage_realization_rate_pct`（UI側にも追加）、入力上限 | **完了（2026-09-05）**。デフォルト85%、UI/MCP両方に実装。理論値/実現値を透明出力。`test_mcp_tools.py`で単調性・スコープ（蓄電池なし時は無効果）を検証 |
-| **4c** ✅ | 系統用蓄電池: 制度調査（託送・容量市場）→ LP実装 → `simulate_grid_battery` | **完了（2026-09-06）**。`optimize_grid_battery`/`build_cashflow_grid_battery`（app.py）＋`validate_grid_battery_params`/`simulate_grid_battery`（mcp_tools.py）実装。`test_mcp_tools.py`で正常系・異常系・パラメータ効果を検証、全PASS。**同日、別セッション（Opus経由）によるMCP実測レビューを受けて5件対応**（バグなし、うち劣化率のサイクル数依存化は仕様変更として実装、他は出力表現の明確化・記録。詳細はCLAUDE.md参照）。公表試算との突合は未実施（突合先データ未特定） |
+| **4c** ✅ | 系統用蓄電池: 制度調査（託送・容量市場）→ LP実装 → `simulate_grid_battery` | **完了（2026-09-06）**。`optimize_grid_battery`/`build_cashflow_grid_battery`（app.py）＋`validate_grid_battery_params`/`simulate_grid_battery`（mcp_tools.py）実装。`test_mcp_tools.py`で正常系・異常系・パラメータ効果を検証、全PASS。**同日、別セッション（Opus経由）によるMCP実測レビューを2回受けて対応**: ①p.44/p.50突合（劣化率のサイクル数依存化を実装、他は出力表現の明確化・記録）、②p.36「シナリオ別収益性構造比較」突合（固定資産税・発電側課金・再エネ賦課金・託送kW建ての4費用項目を追加。うち託送kW建てはMRI引用値がMRI自身のチャート実測値と10倍不整合と判明したため、デフォルト0円のまま未反映）。バグは検出されず、いずれもモデル前提・費用項目の過不足。詳細はCLAUDE.md参照。純アービトラージ収益は当社4.98万円/kWh・MRI 4.97万円/kWh（差0.2%）で一致、費用項目追加後のIRRはMRIベース-1.50%に対し-1.08%まで接近（残差0.42pt） |
 | **4d** | 横展開: gh / biz を同パターンでMCP化（各リポジトリで実施） | 3サーバー同時接続で横断比較が動く |
 | **4e** | OSSドキュメント: MCP接続ガイド（日英）、活用例プロンプト集、READMEバッジ | 第三者がREADMEだけで接続・試算できる |
 
@@ -348,8 +348,20 @@ Codexが正しく提示し、ユーザーの明示確認を経てから本計算
 - [x] `arbitrage_realization_rate_pct`デフォルト85%は変更しない。PV併設ケース向けの値の
       転用であり系統用への妥当性は未検証という事実をdocstring/CLAUDE.mdに記録するに留める
 
+### 決定済み（2026-09-06、MRI p.36突合レビュー対応時）
+- [x] 新規追加する4費用項目（固定資産税・発電側課金・再エネ賦課金・託送kW建て）の
+      デフォルト値はMRI諸元値を採用する（固定資産税のみ、年率換算できないため
+      地方税法の標準税率1.4%で代替）
+- [x] 固定資産税は両モジュール共通（`build_cashflow`/`build_cashflow_grid_battery`）に
+      簿価逓減方式で実装。発電側課金は今回は系統用蓄電池のみに実装しFIP側は見送り
+      （MRIのFIP側諸元p.50に記載がなく対価・要否とも不明なため）
+
 ### 未確定（今後の課題）
 - [ ] 系統用蓄電池単独の公表試算（経産省・OCCTOの容量市場/需給調整市場資料等）との突合。
       MRI資料はPV+蓄電池の突合には使えたが、系統用蓄電池単独の公開試算は未特定
 - [ ] `arbitrage_realization_rate_pct`の系統用蓄電池への適正値の検証（現状85%はPV併設
       ケース由来の転用値）
+- [ ] `wheeling_fee_yen_per_kw_month`の正しい値の特定。MRI p.38引用値503.80円/kW/月は
+      MRI自身のp.36チャート実測値と10倍程度不整合（詳細はCLAUDE.md参照）。デフォルト0円
+      のまま未反映としている
+- [ ] 発電側課金をFIP側モジュール（PV併設）にも実装するかどうかの判断

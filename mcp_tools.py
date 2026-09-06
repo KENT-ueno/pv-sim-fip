@@ -120,6 +120,8 @@ def _normalize_and_validate(
     fit_curtailment_rate_pct: float = 0.0,
     pv_degrade_pct_per_year: float = 0.5,
     arbitrage_realization_rate_pct: float = 85.0,
+    property_tax_rate_pct: float = 1.4,
+    property_tax_residual_ratio_pct: float = 5.0,
 ):
     """パラメータを正規化し (params, warnings, errors) を返す。LPは実行しない。"""
     app = _get_app()
@@ -182,6 +184,10 @@ def _normalize_and_validate(
         errors.append("pv_degrade_pct_per_year は 0〜5 で指定してください")
     if not (0 <= arbitrage_realization_rate_pct <= 100):
         errors.append("arbitrage_realization_rate_pct は 0〜100 で指定してください")
+    if not (0 <= property_tax_rate_pct <= 10):
+        errors.append("property_tax_rate_pct は 0〜10 で指定してください")
+    if not (0 <= property_tax_residual_ratio_pct <= 100):
+        errors.append("property_tax_residual_ratio_pct は 0〜100 で指定してください")
 
     if case == "B":
         if not (1 <= int(fip_transition_year) <= int(fit_term_years)):
@@ -285,6 +291,8 @@ def _normalize_and_validate(
         # ケースA: 新設のため0
         "pv_start_age_years": (int(fip_transition_year) - 1) if case == "B" else 0,
         "arbitrage_realization_rate_pct": float(arbitrage_realization_rate_pct),
+        "property_tax_rate_pct": float(property_tax_rate_pct),
+        "property_tax_residual_ratio_pct": float(property_tax_residual_ratio_pct),
     }
     if case == "B":
         params.update({
@@ -420,6 +428,8 @@ def _run_fip_simulation(case: str, p: dict):
         pv_degrade_pct_per_year=p.get("pv_degrade_pct_per_year", 0.0),
         pv_start_age_years=p.get("pv_start_age_years", 0),
         arbitrage_realization_rate_pct=p.get("arbitrage_realization_rate_pct", 100.0),
+        property_tax_rate_pct=p.get("property_tax_rate_pct", 0.0),
+        property_tax_residual_ratio_pct=p.get("property_tax_residual_ratio_pct", 5.0),
     )
 
     caseb_comparison = None
@@ -464,6 +474,7 @@ def _run_fip_simulation(case: str, p: dict):
             "year": r["year"],
             "revenue_yen": round(r["revenue"]),
             "om_yen": round(r["om"]),
+            "property_tax_yen": round(r.get("property_tax", 0.0)),
             "debt_service_yen": round(r["debt_service"]),
             "battery_replace_yen": round(r.get("battery_replace", 0.0)),
             "decommission_yen": round(r.get("decom_cost", 0.0)),
@@ -512,6 +523,14 @@ def _run_fip_simulation(case: str, p: dict):
         caveats.append(
             f"PV発電量は年{pv_deg:.2f}%の線形劣化を織り込んでキャッシュフローを算出しています{age_note}"
         )
+    if p.get("property_tax_rate_pct", 0.0) > 0:
+        caveats.append(
+            f"固定資産税を税率{p['property_tax_rate_pct']:.2f}%/年・簿価逓減方式"
+            "（PVは法定耐用年数17年、蓄電池はbattery_life_yearsを耐用年数として評価）で"
+            "計上しています（2026-09-06のMRI突合レビュー指摘への対応）"
+        )
+    else:
+        caveats.append("property_tax_rate_pct=0のため固定資産税を考慮していません（収益が過大評価されます）")
 
     return {
         "assumptions": p,
@@ -684,6 +703,11 @@ def _normalize_and_validate_grid_battery(
     capacity_market_price_yen_per_kw_year: float,
     arbitrage_realization_rate_pct: float,
     degrade_baseline_cycles_per_year: float = 365.0,
+    property_tax_rate_pct: float = 1.4,
+    property_tax_residual_ratio_pct: float = 5.0,
+    generator_side_wheeling_yen_per_kw_month: float = 75.13,
+    renewable_energy_levy_yen_per_kwh: float = 3.49,
+    wheeling_fee_yen_per_kw_month: float = 0.0,
 ):
     """系統用蓄電池（PVなし）パラメータを正規化し (params, warnings, errors) を返す。LPは実行しない。"""
     app = _get_app()
@@ -722,6 +746,16 @@ def _normalize_and_validate_grid_battery(
         errors.append("capacity_market_price_yen_per_kw_year は0以上で指定してください")
     if not (0 < degrade_baseline_cycles_per_year <= 3650):
         errors.append("degrade_baseline_cycles_per_year は 0 < x <= 3650 で指定してください")
+    if not (0 <= property_tax_rate_pct <= 10):
+        errors.append("property_tax_rate_pct は 0〜10 で指定してください")
+    if not (0 <= property_tax_residual_ratio_pct <= 100):
+        errors.append("property_tax_residual_ratio_pct は 0〜100 で指定してください")
+    if generator_side_wheeling_yen_per_kw_month < 0:
+        errors.append("generator_side_wheeling_yen_per_kw_month は0以上で指定してください")
+    if renewable_energy_levy_yen_per_kwh < 0:
+        errors.append("renewable_energy_levy_yen_per_kwh は0以上で指定してください")
+    if wheeling_fee_yen_per_kw_month < 0:
+        errors.append("wheeling_fee_yen_per_kw_month は0以上で指定してください")
 
     if 2022 in years:
         warnings.append("2022年度はウクライナ危機による価格高騰年です（結果が楽観側に振れます）")
@@ -740,6 +774,19 @@ def _normalize_and_validate_grid_battery(
         warnings.append(
             "om_ratio_pct_per_year は現在このモジュールでは使用されません"
             "（O&Mは常に battery_om_yen_per_kw_pcs_per_year × 定格出力で計算されます）"
+        )
+    # 2026-09-06 MRI p.36突合レビューで追加された4費用項目。0のままだと収益が過大評価される
+    if property_tax_rate_pct == 0.0:
+        warnings.append("property_tax_rate_pct が0円です（固定資産税を考慮しない楽観的な試算になります）")
+    if generator_side_wheeling_yen_per_kw_month == 0.0:
+        warnings.append("generator_side_wheeling_yen_per_kw_month が0円です（発電側課金を考慮しない楽観的な試算になります）")
+    if renewable_energy_levy_yen_per_kwh == 0.0:
+        warnings.append("renewable_energy_levy_yen_per_kwh が0円です（再エネ賦課金を考慮しない楽観的な試算になります）")
+    if wheeling_fee_yen_per_kw_month == 0.0:
+        warnings.append(
+            "wheeling_fee_yen_per_kw_month が0円です（託送料金の基本料金相当分を考慮しない"
+            "楽観的な試算になります）。MRI引用値503.80円/kW/月はMRI自身のチャート実測値と"
+            "10倍程度整合しないため意図的にデフォルト0としています（詳細はdocstring参照）"
         )
 
     params = {
@@ -770,6 +817,11 @@ def _normalize_and_validate_grid_battery(
         "capacity_market_price_yen_per_kw_year": float(capacity_market_price_yen_per_kw_year),
         "arbitrage_realization_rate_pct": float(arbitrage_realization_rate_pct),
         "degrade_baseline_cycles_per_year": float(degrade_baseline_cycles_per_year),
+        "property_tax_rate_pct": float(property_tax_rate_pct),
+        "property_tax_residual_ratio_pct": float(property_tax_residual_ratio_pct),
+        "generator_side_wheeling_yen_per_kw_month": float(generator_side_wheeling_yen_per_kw_month),
+        "renewable_energy_levy_yen_per_kwh": float(renewable_energy_levy_yen_per_kwh),
+        "wheeling_fee_yen_per_kw_month": float(wheeling_fee_yen_per_kw_month),
     }
     return params, warnings, errors
 
@@ -796,6 +848,19 @@ def _run_grid_battery_simulation(p: dict):
     subsidy_bat = bat_capex * p["subsidy_battery_pct"] / 100.0
     capacity_market_revenue = p["capacity_market_price_yen_per_kw_year"] * p["battery_max_discharge_kw"]
 
+    # 2026-09-06 MRI p.36突合レビューで追加された4費用項目のうち、kW建ての2つ（発電側課金・
+    # 託送kW建て）はPCS容量に基づく固定年額のため、容量市場収益と同様にここで事前計算する。
+    # 発電側課金はMRI試算に倣いkWh分（充放電ロス分）を考慮しない（kW分のみ）。
+    generator_side_wheeling_cost = (
+        p["generator_side_wheeling_yen_per_kw_month"] * p["battery_max_discharge_kw"] * 12.0
+    )
+    # 託送kW建ては契約容量（充電・放電の大きい方）に基づく基本料金相当
+    wheeling_kw_cost = (
+        p["wheeling_fee_yen_per_kw_month"]
+        * max(p["battery_max_charge_kw"], p["battery_max_discharge_kw"]) * 12.0
+    )
+    annual_energy_loss_kwh = opt["annual_charge_kwh"] - opt["annual_discharge_kwh"]
+
     cf_result = app.build_cashflow_grid_battery(
         bat_capex=bat_capex, subsidy_bat=subsidy_bat,
         annual_arbitrage_revenue=opt["annual_arbitrage_revenue_yen"],
@@ -816,6 +881,12 @@ def _run_grid_battery_simulation(p: dict):
         arbitrage_realization_rate_pct=p.get("arbitrage_realization_rate_pct", 100.0),
         annual_equivalent_cycles=opt["equivalent_full_cycles_usable_soc"],
         degrade_baseline_cycles_per_year=p.get("degrade_baseline_cycles_per_year", 365.0),
+        property_tax_rate_pct=p.get("property_tax_rate_pct", 0.0),
+        property_tax_residual_ratio_pct=p.get("property_tax_residual_ratio_pct", 5.0),
+        annual_energy_loss_kwh=annual_energy_loss_kwh,
+        renewable_energy_levy_yen_per_kwh=p.get("renewable_energy_levy_yen_per_kwh", 0.0),
+        generator_side_wheeling_cost_yen_per_year=generator_side_wheeling_cost,
+        wheeling_kw_cost_yen_per_year=wheeling_kw_cost,
     )
 
     cashflow_rows = []
@@ -824,6 +895,10 @@ def _run_grid_battery_simulation(p: dict):
             "year": r["year"],
             "revenue_yen": round(r["revenue"]),
             "om_yen": round(r["om"]),
+            "property_tax_yen": round(r.get("property_tax", 0.0)),
+            "generator_wheeling_cost_yen": round(r.get("generator_wheeling_cost", 0.0)),
+            "wheeling_kw_cost_yen": round(r.get("wheeling_kw_cost", 0.0)),
+            "renewable_levy_yen": round(r.get("renewable_levy", 0.0)),
             "debt_service_yen": round(r["debt_service"]),
             "battery_replace_yen": round(r.get("battery_replace", 0.0)),
             "decommission_yen": round(r.get("decom_cost", 0.0)),
@@ -854,9 +929,34 @@ def _run_grid_battery_simulation(p: dict):
         f"実効劣化率{cf_result['effective_bat_degrade_pct_per_year']:.2f}%/年をキャッシュフローに使用しています",
     ]
     if p["wheeling_fee_yen_per_kwh"] == 0.0:
-        caveats.append("wheeling_fee_yen_per_kwh=0円のため託送料金を考慮していません（収益が過大評価されます）")
+        caveats.append("wheeling_fee_yen_per_kwh=0円のため託送料金（kWh従量分）を考慮していません（収益が過大評価されます）")
     if p["capacity_market_price_yen_per_kw_year"] == 0.0:
         caveats.append("capacity_market_price_yen_per_kw_year=0円のため容量市場収益を含んでいません")
+    # 2026-09-06 MRI p.36突合レビューで追加された4費用項目のcaveats
+    if p.get("property_tax_rate_pct", 0.0) > 0:
+        caveats.append(
+            f"固定資産税を税率{p['property_tax_rate_pct']:.2f}%/年・簿価逓減方式"
+            "（蓄電池のbattery_life_yearsを耐用年数として評価）で計上しています"
+        )
+    else:
+        caveats.append("property_tax_rate_pct=0のため固定資産税を考慮していません（収益が過大評価されます）")
+    if p.get("generator_side_wheeling_yen_per_kw_month", 0.0) == 0.0:
+        caveats.append("generator_side_wheeling_yen_per_kw_month=0円のため発電側課金を考慮していません")
+    if p.get("renewable_energy_levy_yen_per_kwh", 0.0) == 0.0:
+        caveats.append("renewable_energy_levy_yen_per_kwh=0円のため再エネ賦課金を考慮していません")
+    else:
+        caveats.append(
+            "再エネ賦課金は充放電ロス量（充電量−放電量）に対して課税する近似です"
+            "（MRI p.38「充放電ロス分に考慮」の解釈を踏襲。系統から充電するため需要家として発生する"
+            "系統用蓄電池固有の費用で、PV併設蓄電池には発生しません）"
+        )
+    if p.get("wheeling_fee_yen_per_kw_month", 0.0) == 0.0:
+        caveats.append(
+            "wheeling_fee_yen_per_kw_month=0円のため託送料金の基本料金（kW建て）相当分を"
+            "考慮していません。MRI引用値503.80円/kW/月をそのまま適用すると20年40,264円/kWh"
+            "となりMRI自身のチャート実測値（3,900〜4,200円/kWh、既知項目は<0.2%精度で一致）"
+            "の約10倍に達し不整合なため、正しい値が判明するまで意図的に未設定としています"
+        )
 
     return {
         "assumptions": p,
@@ -872,10 +972,15 @@ def _run_grid_battery_simulation(p: dict):
             "arbitrage_realization_rate_pct": cf_result["arbitrage_realization_rate_pct"],
             "cycle_intensity_ratio": round(cf_result["cycle_intensity_ratio"], 2),
             "effective_bat_degrade_pct_per_year": round(cf_result["effective_bat_degrade_pct_per_year"], 2),
+            "annual_property_tax_year1_yen": round(cf_result["rows"][1].get("property_tax", 0.0)) if len(cf_result["rows"]) > 1 else 0,
+            "annual_generator_wheeling_cost_yen": round(generator_side_wheeling_cost),
+            "annual_wheeling_kw_cost_yen": round(wheeling_kw_cost),
+            "annual_renewable_levy_year1_yen": round(cf_result["rows"][1].get("renewable_levy", 0.0)) if len(cf_result["rows"]) > 1 else 0,
         },
         "annual": {
             "battery_charge_kwh": round(opt["annual_charge_kwh"]),
             "battery_discharge_kwh": round(opt["annual_discharge_kwh"]),
+            "energy_loss_kwh": round(annual_energy_loss_kwh),
             "equivalent_full_cycles_nameplate": round(opt["equivalent_full_cycles_nameplate"], 1),
             "equivalent_full_cycles_usable_soc": round(opt["equivalent_full_cycles_usable_soc"], 1),
             "cycle_basis_note": "nameplateは放電量÷定格容量、usable_socは放電量÷実使用可能容量"
@@ -979,6 +1084,8 @@ def validate_fip_params(
     fit_curtailment_rate_pct: float = 0.0,
     pv_degrade_pct_per_year: float = 0.5,
     arbitrage_realization_rate_pct: float = 85.0,
+    property_tax_rate_pct: float = 1.4,
+    property_tax_residual_ratio_pct: float = 5.0,
 ) -> dict:
     """FIP事業性シミュレーションのパラメータを検証する（即答・LP実行なし）。
 
@@ -1033,6 +1140,12 @@ def validate_fip_params(
             LP最適化は1年分のJEPX価格を完全予見する理論上限のため、実運用（前日予測ベース）
             の蓄電池増分収益はこれを下回るのが通常。蓄電池による増分収益にのみ適用し、
             ベースラインのJEPX直売収入には適用しない
+        property_tax_rate_pct: 固定資産税率 [%/年]（デフォルト1.4=地方税法の標準税率）。
+            PVは法定耐用年数17年、蓄電池はbattery_life_yearsを耐用年数とする簿価逓減方式
+            （2026-09-06のMRI p.36突合レビュー指摘への対応。ケースBはpv_capexが
+            サンクコスト扱い＝0のためPV分の税額も自然に0になる）
+        property_tax_residual_ratio_pct: 固定資産税評価上の残存価額下限
+            [取得価額に対する%]（デフォルト5%）
 
     Returns:
         dict: {"valid": bool, "normalized_params": {...}, "warnings": [...], "errors": [...]}
@@ -1062,6 +1175,7 @@ def validate_fip_params(
             fit_tariff_yen_per_kwh, fit_term_years, fip_transition_year,
             pv_acquisition_cost_yen, fit_curtailment_rate_pct,
             pv_degrade_pct_per_year, arbitrage_realization_rate_pct,
+            property_tax_rate_pct, property_tax_residual_ratio_pct,
         )
         return {
             "valid": len(errors) == 0,
@@ -1113,6 +1227,8 @@ def simulate_fip_case_a(
     irr_period_years: int = 20,
     pv_degrade_pct_per_year: float = 0.5,
     arbitrage_realization_rate_pct: float = 85.0,
+    property_tax_rate_pct: float = 1.4,
+    property_tax_residual_ratio_pct: float = 5.0,
 ) -> dict:
     """ケースA: 新規FIP発電所＋蓄電池の事業性を試算する（実行30〜90秒、LP最適化を含む）。
 
@@ -1161,6 +1277,10 @@ def simulate_fip_case_a(
         pv_degrade_pct_per_year: PV年間劣化率 [%/年]（線形、結晶シリコン一般値の目安0.5）
         arbitrage_realization_rate_pct: 蓄電池アービトラージ実現率 [%]（デフォルト85。
             完全予見LPの理論値を実運用想定に補正。蓄電池の増分収益にのみ適用）
+        property_tax_rate_pct: 固定資産税率 [%/年]（デフォルト1.4=地方税法の標準税率）。
+            PVは法定耐用年数17年、蓄電池はbattery_life_yearsを耐用年数とする簿価逓減方式
+        property_tax_residual_ratio_pct: 固定資産税評価上の残存価額下限
+            [取得価額に対する%]（デフォルト5%）
 
     Returns:
         dict: assumptions（入力エコー）/ kpis（IRR・NPV・回収年数）/
@@ -1196,6 +1316,8 @@ def simulate_fip_case_a(
         irr_period_years=irr_period_years,
         pv_degrade_pct_per_year=pv_degrade_pct_per_year,
         arbitrage_realization_rate_pct=arbitrage_realization_rate_pct,
+        property_tax_rate_pct=property_tax_rate_pct,
+        property_tax_residual_ratio_pct=property_tax_residual_ratio_pct,
     )
     if not v.get("valid"):
         return {"error": "パラメータ検証エラー", "errors": v.get("errors", []),
@@ -1249,6 +1371,8 @@ def simulate_fip_case_b(
     fit_curtailment_rate_pct: float = 0.0,
     pv_degrade_pct_per_year: float = 0.5,
     arbitrage_realization_rate_pct: float = 85.0,
+    property_tax_rate_pct: float = 1.4,
+    property_tax_residual_ratio_pct: float = 5.0,
 ) -> dict:
     """ケースB: 既存FIT発電所のFIP転＋蓄電池後付けの事業性を試算する（実行30〜90秒）。
 
@@ -1304,6 +1428,12 @@ def simulate_fip_case_b(
             FIP転時点のPV既経過年数（fip_transition_year-1）を劣化計算の起点に含める
         arbitrage_realization_rate_pct: 蓄電池アービトラージ実現率 [%]（デフォルト85。
             完全予見LPの理論値を実運用想定に補正。蓄電池の増分収益にのみ適用）
+        property_tax_rate_pct: 固定資産税率 [%/年]（デフォルト1.4=地方税法の標準税率）。
+            PVは法定耐用年数17年、蓄電池はbattery_life_yearsを耐用年数とする簿価逓減方式。
+            ケースBはpv_capexがサンクコスト扱い（IRR計算上0）のため、PV分の固定資産税も
+            増分CF計算上は自然にキャンセルされる（既存のPV O&Mと同じ扱い）
+        property_tax_residual_ratio_pct: 固定資産税評価上の残存価額下限
+            [取得価額に対する%]（デフォルト5%）
 
     Returns:
         dict: assumptions / kpis（増分CFベースのIRR・NPV・回収年数）/ annual /
@@ -1343,6 +1473,8 @@ def simulate_fip_case_b(
         fit_curtailment_rate_pct=fit_curtailment_rate_pct,
         pv_degrade_pct_per_year=pv_degrade_pct_per_year,
         arbitrage_realization_rate_pct=arbitrage_realization_rate_pct,
+        property_tax_rate_pct=property_tax_rate_pct,
+        property_tax_residual_ratio_pct=property_tax_residual_ratio_pct,
     )
     if not v.get("valid"):
         return {"error": "パラメータ検証エラー", "errors": v.get("errors", []),
@@ -1386,6 +1518,11 @@ def validate_grid_battery_params(
     capacity_market_price_yen_per_kw_year: float = 0.0,
     arbitrage_realization_rate_pct: float = 85.0,
     degrade_baseline_cycles_per_year: float = 365.0,
+    property_tax_rate_pct: float = 1.4,
+    property_tax_residual_ratio_pct: float = 5.0,
+    generator_side_wheeling_yen_per_kw_month: float = 75.13,
+    renewable_energy_levy_yen_per_kwh: float = 3.49,
+    wheeling_fee_yen_per_kw_month: float = 0.0,
 ) -> dict:
     """太陽光を伴わない系統用蓄電池単独事業のパラメータを検証する（即答・LP実行なし）。
 
@@ -1442,6 +1579,29 @@ def validate_grid_battery_params(
             系統用蓄電池は完全予見LPの下で1日1回を大きく超える頻度で充放電することが多く
             （実測例: 九州で年515回＝1日1.76回）、その場合は入力した年間劣化率より速く
             劣化する前提になる（2026-09-06のMCP実測レビュー指摘への対応）
+        property_tax_rate_pct: 固定資産税率 [%/年]（デフォルト1.4=地方税法の標準税率）。
+            蓄電池のbattery_life_yearsを耐用年数とする簿価逓減方式で評価する
+            （2026-09-06のMRI p.36突合レビュー指摘への対応）。MRIのp.36算定諸元は
+            20年累計の税負担比率（取得価額の9.67%相当）として与えられているが、
+            本パラメータは年率のため直接換算できず、地方税法の標準税率1.4%を
+            採用している（デフォルトのbattery_life_years=20年では累計約11.7%相当となり、
+            MRI参考値と同程度のオーダー）
+        property_tax_residual_ratio_pct: 固定資産税評価上の残存価額下限
+            [取得価額に対する%]（デフォルト5%、一般的な最低限度額）
+        generator_side_wheeling_yen_per_kw_month: 発電側課金 [円/kW/月]
+            （デフォルト75.13=MRI p.38の全国平均値）。battery_max_discharge_kw×12ヶ月分を
+            年額固定費として計上。kWh従量分（充放電ロス分）はMRI試算に倣い含めない
+        renewable_energy_levy_yen_per_kwh: 再エネ賦課金 [円/kWh]（デフォルト3.49=MRI p.38の
+            2024年度想定値）。充放電ロス量（充電量−放電量）に課税する近似
+            （PV併設蓄電池には発生しない系統用蓄電池固有の費用）
+        wheeling_fee_yen_per_kw_month: 託送料金の基本料金相当 [円/kW/月]（デフォルト0=未考慮）。
+            既存のwheeling_fee_yen_per_kwh（kWh従量分）とは別建てで、契約容量（充電・放電の
+            大きい方）に基づき計上する。MRI p.38は503.80円/kW/月と記載しているが、この値を
+            そのまま適用すると20年で40,264円/kWhとなり、MRI p.36チャート実測値（託送料金
+            kW+kWh合計で20年3,900〜4,200円/kWhのみ、他の既知項目は<0.2%精度で一致確認済み）
+            の約10倍に達し整合しない。単位（月/年）の誤記または当社の契約容量の捉え方の
+            相違が疑われるが2026-09-06時点で未解決のため、デフォルトは0円とし、正しい値が
+            判明ないし別途検証されるまでは明示的に含めない方針としている
 
     Returns:
         dict: {"valid": bool, "normalized_params": {...}, "warnings": [...], "errors": [...]}
@@ -1460,6 +1620,9 @@ def validate_grid_battery_params(
             loan_interest_pct, loan_years, irr_period_years,
             wheeling_fee_yen_per_kwh, capacity_market_price_yen_per_kw_year,
             arbitrage_realization_rate_pct, degrade_baseline_cycles_per_year,
+            property_tax_rate_pct, property_tax_residual_ratio_pct,
+            generator_side_wheeling_yen_per_kw_month, renewable_energy_levy_yen_per_kwh,
+            wheeling_fee_yen_per_kw_month,
         )
         return {
             "valid": len(errors) == 0,
@@ -1501,6 +1664,11 @@ def simulate_grid_battery(
     capacity_market_price_yen_per_kw_year: float = 0.0,
     arbitrage_realization_rate_pct: float = 85.0,
     degrade_baseline_cycles_per_year: float = 365.0,
+    property_tax_rate_pct: float = 1.4,
+    property_tax_residual_ratio_pct: float = 5.0,
+    generator_side_wheeling_yen_per_kw_month: float = 75.13,
+    renewable_energy_levy_yen_per_kwh: float = 3.49,
+    wheeling_fee_yen_per_kw_month: float = 0.0,
 ) -> dict:
     """太陽光を伴わない系統用蓄電池単独の事業性を試算する（実行10〜30秒、LP最適化を含む）。
 
@@ -1541,11 +1709,20 @@ def simulate_grid_battery(
         degrade_baseline_cycles_per_year: battery_degrade_pct_per_year の前提サイクル数
             [回/年]（デフォルト365=1回/日）。実際の年間サイクル数との比率で劣化率を
             スケールする（詳細は validate_grid_battery_params 参照）
+        property_tax_rate_pct: 固定資産税率 [%/年]（デフォルト1.4=地方税法の標準税率、
+            簿価逓減方式。詳細は validate_grid_battery_params 参照）
+        property_tax_residual_ratio_pct: 固定資産税評価上の残存価額下限 [%]（デフォルト5%）
+        generator_side_wheeling_yen_per_kw_month: 発電側課金 [円/kW/月]
+            （デフォルト75.13=MRI参考値。kW分のみ、kWh従量分は含まない）
+        renewable_energy_levy_yen_per_kwh: 再エネ賦課金 [円/kWh]（デフォルト3.49=MRI参考値。
+            充放電ロス量に課税。系統用蓄電池固有の費用）
+        wheeling_fee_yen_per_kw_month: 託送料金の基本料金相当 [円/kW/月]
+            （デフォルト503.80=MRI参考値。wheeling_fee_yen_per_kwhとは別建て）
 
     Returns:
         dict: assumptions（入力エコー）/ kpis（IRR・NPV・回収年数・アービトラージ内訳・
-              サイクル強度による劣化率補正）/ annual（充放電量・2種類の等価フルサイクル数）/
-              cashflow（年次CF）/ caveats（免責事項）
+              サイクル強度による劣化率補正・費用項目の内訳）/ annual（充放電量・ロス量・
+              2種類の等価フルサイクル数）/ cashflow（年次CF、費用項目別）/ caveats（免責事項）
     """
     v = validate_grid_battery_params(
         jepx_area=jepx_area, jepx_fiscal_years=jepx_fiscal_years,
@@ -1571,6 +1748,11 @@ def simulate_grid_battery(
         capacity_market_price_yen_per_kw_year=capacity_market_price_yen_per_kw_year,
         arbitrage_realization_rate_pct=arbitrage_realization_rate_pct,
         degrade_baseline_cycles_per_year=degrade_baseline_cycles_per_year,
+        property_tax_rate_pct=property_tax_rate_pct,
+        property_tax_residual_ratio_pct=property_tax_residual_ratio_pct,
+        generator_side_wheeling_yen_per_kw_month=generator_side_wheeling_yen_per_kw_month,
+        renewable_energy_levy_yen_per_kwh=renewable_energy_levy_yen_per_kwh,
+        wheeling_fee_yen_per_kw_month=wheeling_fee_yen_per_kw_month,
     )
     if not v.get("valid"):
         return {"error": "パラメータ検証エラー", "errors": v.get("errors", []),
