@@ -951,6 +951,244 @@ def optimize_capacity_fip(generation_30min, jepx_prices, month_day,
 
 
 # ============================================================
+# 系統用蓄電池（PVなし）単独モジュール — MCP専用（Phase 4c、2026-09-06）
+# ============================================================
+# 制度面の割り切り（CLAUDE.md参照）:
+#   - JEPXスポット市場での充放電アービトラージのみをLPでモデル化する
+#   - 容量市場（kW価値）は円/kW/年の固定単価をユーザー入力とし、CFに定額計上する
+#     （実勢価格は年度・入札結果で変動し、デレーティング等の精緻な入札行動はモデル化しない）
+#   - 託送料金（wheeling fee）は円/kWh固定単価で充放電の往復に対称適用する近似
+#     （実際はエリア・電圧階級・発電側/需要側課金の別で変動する）
+#   - 需給調整市場（EPRX1/2/3等）は明示的にスコープ外
+#     （商品区分ごとに応動時間・拘束時間が異なり、実勢価格データの入手も容易でないため、
+#       精度の低い金額を出すより「対象外」と明示する方が誠実という既存方針を踏襲）
+
+def build_grid_battery_month_day():
+    """PVに依存しない365日分のmonth_day（非うるう年。jepx.db/radiation.dbと同じ並び）。"""
+    days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    month_day = []
+    for m, n in enumerate(days_in_month, start=1):
+        for d in range(1, n + 1):
+            month_day.append((m, d))
+    return month_day
+
+
+def optimize_grid_battery(jepx_prices, capacity_kwh, max_charge_kw, max_discharge_kw,
+                          eff_charge_pct, eff_discharge_pct,
+                          soc_min_pct, soc_max_pct,
+                          wheeling_fee_yen_per_kwh=0.0):
+    """PVを持たない系統用蓄電池のJEPXアービトラージをLPで求める。
+
+    目的関数: 年間差益の最大化
+        maximize Σ_t [discharge(t) × (price(t) − fee) − charge(t) × (price(t) + fee)]
+        ※fee=託送料金[円/kWh]。充電（買電）・放電（売電）の両方に対称適用する近似。
+
+    optimize_battery_fip との違い:
+        - PV発電がないため charge は系統からの買電のみ（エネルギーバランス式・
+          export/curtailment変数は不要）
+    """
+    if not HAS_PULP:
+        raise RuntimeError("PuLPがインストールされていません。pip install PuLP を実行してください。")
+
+    n_days, n_slots = jepx_prices.shape
+    T = n_days * n_slots
+    dt = 0.5
+
+    eff_ch = eff_charge_pct / 100.0
+    eff_dc = eff_discharge_pct / 100.0
+    soc_min = capacity_kwh * soc_min_pct / 100.0
+    soc_max = capacity_kwh * soc_max_pct / 100.0
+    max_charge_per_slot = max_charge_kw * dt
+    max_discharge_per_slot = max_discharge_kw * dt
+    max_power_per_slot = max(max_charge_per_slot, max_discharge_per_slot)
+
+    price_flat = jepx_prices.flatten()
+
+    prob = pulp.LpProblem("Grid_Battery_Arbitrage", pulp.LpMaximize)
+
+    charge = [pulp.LpVariable(f"gch_{t}", lowBound=0, upBound=max_charge_per_slot) for t in range(T)]
+    discharge = [pulp.LpVariable(f"gdc_{t}", lowBound=0, upBound=max_discharge_per_slot) for t in range(T)]
+    soc_var = [pulp.LpVariable(f"gsoc_{t}", lowBound=soc_min, upBound=soc_max) for t in range(T)]
+
+    prob += pulp.lpSum([
+        discharge[t] * (price_flat[t] - wheeling_fee_yen_per_kwh)
+        - charge[t] * (price_flat[t] + wheeling_fee_yen_per_kwh)
+        for t in range(T)
+    ])
+
+    for t in range(T):
+        # PCS同時稼働制約（ソフト mutual exclusion、optimize_battery_fipと同じ）
+        prob += charge[t] + discharge[t] <= max_power_per_slot
+        if t == 0:
+            prob += soc_var[t] == soc_min + charge[t] * eff_ch - discharge[t] / eff_dc
+        else:
+            prob += soc_var[t] == soc_var[t - 1] + charge[t] * eff_ch - discharge[t] / eff_dc
+
+    # 終端SOC = 初期SOC
+    prob += soc_var[T - 1] == soc_min
+
+    solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=180)
+    prob.solve(solver)
+
+    if prob.status != pulp.constants.LpStatusOptimal:
+        raise RuntimeError(f"系統用蓄電池LPに失敗しました（ステータス: {pulp.LpStatus[prob.status]}）")
+
+    charge_vals = np.array([ch.varValue for ch in charge]).reshape(n_days, n_slots)
+    discharge_vals = np.array([dc.varValue for dc in discharge]).reshape(n_days, n_slots)
+    soc_vals = np.array([s.varValue for s in soc_var]).reshape(n_days, n_slots)
+
+    annual_charge = float(np.sum(charge_vals))
+    annual_discharge = float(np.sum(discharge_vals))
+    annual_revenue = float(pulp.value(prob.objective))
+    equivalent_cycles = annual_discharge / capacity_kwh if capacity_kwh > 0 else 0.0
+
+    return {
+        "battery_charge": charge_vals,
+        "battery_discharge": discharge_vals,
+        "soc": soc_vals,
+        "annual_charge_kwh": annual_charge,
+        "annual_discharge_kwh": annual_discharge,
+        "annual_arbitrage_revenue_yen": annual_revenue,
+        "equivalent_full_cycles": equivalent_cycles,
+        "battery_capacity_kwh": capacity_kwh,
+    }
+
+
+def build_cashflow_grid_battery(
+    bat_capex, subsidy_bat,
+    annual_arbitrage_revenue, capacity_market_revenue_yen_per_year,
+    om_ratio_pct, equity_ratio_pct,
+    loan_interest_pct, loan_years, irr_period_years,
+    bat_life_years, bat_degrade_pct_per_year, bat_eol_action,
+    bat_replace_cost_ratio_pct,
+    bat_om_mode="CAPEX比（PVと共通）",
+    om_bat_per_kw_pcs=5_000.0,
+    bat_max_charge_kw=0.0,
+    decom_pct=0.0,
+    arbitrage_realization_rate_pct=100.0,
+):
+    """系統用蓄電池単独（PVなし）の年次キャッシュフローを構築する。
+
+    build_cashflow との違い:
+        - PVがないため二重フェーズ（プレミアム有無）や pv_degrade は存在しない
+        - 収益は「JEPXアービトラージ（LP、実現率補正）＋容量市場収益（固定）」の1本
+        - 容量市場収益は kW価値（供出力）に対する対価のため、蓄電池のエネルギー容量劣化
+          （degrade_factor）とは連動させず、蓄電池が有効な間は満額とする近似
+          （PCS自体の出力能力はエネルギー容量劣化とは別軸で管理されるため）
+
+    Args:
+        bat_capex, subsidy_bat: 蓄電池投資額・補助金 [円]
+        annual_arbitrage_revenue: LP理論値の年間アービトラージ収益 [円/年]（劣化前・実現率補正前）
+        capacity_market_revenue_yen_per_year: 容量市場収益 [円/年]（固定入力）
+        arbitrage_realization_rate_pct: 蓄電池アービトラージ実現率 [%]（デフォルト100=無補正）
+        その他は build_cashflow と同じ意味
+    """
+    total_capex_gross = bat_capex
+    total_subsidy = subsidy_bat
+    net_capex = total_capex_gross - total_subsidy
+
+    equity_ratio = equity_ratio_pct / 100.0
+    equity = net_capex * equity_ratio
+    debt = net_capex * (1 - equity_ratio)
+    annual_loan_payment = calc_loan_payment(debt, loan_interest_pct, loan_years)
+
+    if bat_capex <= 0:
+        bat_annual_om = 0.0
+    elif bat_om_mode == "PCS_kW建て（三菱総研試算）":
+        bat_annual_om = bat_max_charge_kw * om_bat_per_kw_pcs
+    else:
+        bat_annual_om = bat_capex * (om_ratio_pct / 100.0)
+
+    realization_factor = arbitrage_realization_rate_pct / 100.0
+    arbitrage_initial = annual_arbitrage_revenue * realization_factor
+
+    rows = []
+    project_cf_0 = -net_capex
+    equity_cf_0 = -equity
+    rows.append({
+        "year": 0, "revenue": 0.0, "om": 0.0, "debt_service": 0.0,
+        "battery_replace": 0.0, "decom_cost": 0.0, "ebitda": 0.0,
+        "initial_capex": project_cf_0,
+        "net_cf": equity_cf_0, "project_cf": project_cf_0,
+        "cum_project": project_cf_0, "cum_net": equity_cf_0,
+    })
+
+    bat_replace_unit_ratio = bat_replace_cost_ratio_pct / 100.0
+    cum_proj = project_cf_0
+    cum_net = equity_cf_0
+    bat_active = (bat_capex > 0)
+
+    for y in range(1, irr_period_years + 1):
+        if bat_active:
+            life_used = (y - 1) % bat_life_years
+            degrade_factor = max(0.0, 1.0 - bat_degrade_pct_per_year / 100.0 * life_used)
+            year_revenue = arbitrage_initial * degrade_factor + capacity_market_revenue_yen_per_year
+        else:
+            degrade_factor = 0.0
+            year_revenue = 0.0
+
+        bat_replace_cost = 0.0
+        if bat_active and (y % bat_life_years == 0) and y < irr_period_years:
+            if bat_eol_action == "終了（蓄電池なし運用）":
+                bat_active = False
+            else:
+                bat_replace_cost = bat_capex * bat_replace_unit_ratio
+
+        year_om = bat_annual_om if bat_active else 0.0
+        year_debt_service = annual_loan_payment if y <= loan_years else 0.0
+
+        decom_cost = 0.0
+        if y == irr_period_years and decom_pct > 0:
+            decom_cost = total_capex_gross * (decom_pct / 100.0)
+
+        ebitda = year_revenue - year_om
+        project_cf = ebitda - bat_replace_cost - decom_cost
+        net_cf = project_cf - year_debt_service
+
+        cum_proj += project_cf
+        cum_net += net_cf
+
+        rows.append({
+            "year": y, "revenue": year_revenue, "om": year_om,
+            "debt_service": year_debt_service, "battery_replace": bat_replace_cost,
+            "decom_cost": decom_cost, "ebitda": ebitda,
+            "net_cf": net_cf, "project_cf": project_cf,
+            "cum_project": cum_proj, "cum_net": cum_net,
+        })
+
+    project_cfs = [r["project_cf"] for r in rows]
+    project_irr = calc_irr(project_cfs)
+    project_npv = calc_npv(project_cfs, loan_interest_pct)
+
+    payback_year = None
+    for r in rows[1:]:
+        if r["cum_project"] >= 0:
+            payback_year = r["year"]
+            break
+
+    ebitda_list = [r["ebitda"] for r in rows[1:]]
+    avg_ebitda = sum(ebitda_list) / len(ebitda_list) if ebitda_list else 0
+
+    return {
+        "rows": rows,
+        "total_capex_gross": total_capex_gross,
+        "total_subsidy": total_subsidy,
+        "net_capex": net_capex,
+        "equity": equity,
+        "debt": debt,
+        "annual_loan_payment": annual_loan_payment,
+        "annual_om": bat_annual_om,
+        "project_irr": project_irr,
+        "project_npv": project_npv,
+        "payback_year": payback_year,
+        "avg_ebitda": avg_ebitda,
+        "arbitrage_realization_rate_pct": arbitrage_realization_rate_pct,
+        "arbitrage_value_theoretical_yen": annual_arbitrage_revenue,
+        "arbitrage_value_realized_yen": arbitrage_initial,
+    }
+
+
+# ============================================================
 # 経済性計算（CAPEX / OPEX / 借入金 / CF / IRR）
 # ============================================================
 
@@ -3074,6 +3312,8 @@ def build_ui():
         gr.api(mcp_tools.validate_fip_params, api_name="validate_fip_params")
         gr.api(mcp_tools.simulate_fip_case_a, api_name="simulate_fip_case_a")
         gr.api(mcp_tools.simulate_fip_case_b, api_name="simulate_fip_case_b")
+        gr.api(mcp_tools.validate_grid_battery_params, api_name="validate_grid_battery_params")
+        gr.api(mcp_tools.simulate_grid_battery, api_name="simulate_grid_battery")
 
     return demo
 

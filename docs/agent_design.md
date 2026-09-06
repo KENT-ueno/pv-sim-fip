@@ -84,8 +84,8 @@ Claude (エージェント) ┼─ (MCP) ─ pv-sim-gh    … 家庭用需給
 |---|---|---|
 | `simulate_fip_case_a(...)` | 新規FIP＋蓄電池（現ケースA） | 30〜90秒 |
 | `simulate_fip_case_b(...)` | 既存FIT→FIP転（現ケースB、増分CF評価） | 30〜90秒 |
-| `simulate_grid_battery(...)` | **新規**: 系統用蓄電池単独（§5） | 30〜90秒 |
-| `search_optimal_capacity(...)` | 最適容量探索（2段階） | 2〜3分（docstringに明示警告） |
+| `simulate_grid_battery(...)` | ✅実装済み（Phase 4c）: 系統用蓄電池単独（§5） | 10〜30秒（PVを伴わない分、fipより軽量） |
+| `search_optimal_capacity(...)` | 最適容量探索（2段階）※未実装、将来課題 | 2〜3分（docstringに明示警告） |
 
 ### 出力JSONスキーマ（simulate系共通）
 
@@ -144,38 +144,45 @@ Claude (エージェント) ┼─ (MCP) ─ pv-sim-gh    … 家庭用需給
 
 ---
 
-## 5. 系統用蓄電池モジュール（simulate_grid_battery）
+## 5. 系統用蓄電池モジュール（simulate_grid_battery）✅ 完了（2026-09-06、Phase 4c）
 
-現スイート唯一の空白セグメント。fipのLPエンジンの変形として本リポジトリに実装する。
+現スイート唯一の空白セグメントだったが、fipのLPエンジンの変形として本リポジトリに実装した。
+新規HF Spaceは作らず、MCP専用ツール（Gradio UIコンポーネントなし）として追加している。
 
-### LP定式化（案）
+### LP定式化（実装済み、`app.py::optimize_grid_battery`）
 ```
 決定変数（30分コマ t = 0..17519）:
-  buy(t)  ≥ 0 : 系統からの充電量 [kWh/30分]
-  sell(t) ≥ 0 : 系統への放電販売量 [kWh/30分]
-  soc(t)      : 蓄電池残量 [kWh]
+  charge(t)    ≥ 0 : 系統からの充電量 [kWh/30分]
+  discharge(t) ≥ 0 : 系統への放電販売量 [kWh/30分]
+  soc(t)            : 蓄電池残量 [kWh]
 
 目的関数:
-  maximize Σ_t [ sell(t) × (jepx(t) + premium + nonfossil − bg_fee)
-               − buy(t) × (jepx(t) + wheeling_fee + purchase_fees) ]
+  maximize Σ_t [ discharge(t) × (jepx(t) − wheeling_fee)
+               − charge(t)    × (jepx(t) + wheeling_fee) ]
 
 制約:
-  SOC遷移: soc(t) = soc(t-1) + buy(t)×η_ch − sell(t)/η_dc
+  SOC遷移: soc(t) = soc(t-1) + charge(t)×η_ch − discharge(t)/η_dc
   SOC範囲 / 充放電レート / 終端SOC=初期SOC（fipと同じ）
-  mutual exclusion: buy(t) + sell(t) ≤ max_power_per_slot（パススルー防止、fipで実証済み）
+  mutual exclusion: charge(t) + discharge(t) ≤ max_power_per_slot（パススルー防止、fipで実証済み）
 ```
+`optimize_battery_fip`との差分はPV発電・export・curtailment関連の項を除いただけで、
+LP自体の複雑さはむしろ縮小している（決定変数3種→3種だがexport/curtail変数が不要）。
 
-### 制度パラメータ（第一弾の割り切り）
+### 制度パラメータ（実装確定。当初案からの変更点を含む）
 | 項目 | 扱い |
 |---|---|
-| 託送料金（充電時） | ユーザー入力 [円/kWh]（**制度調査が必要**: 発電側/需要側課金の扱いが流動的） |
-| FIPプレミアム | 入力可（蓄電池単独もFIP認定対象。基準価格はユーザー入力） |
-| 容量市場収入 | 固定額入力 [円/kW/年]（オークション価格はユーザーが調べて入れる） |
-| 需給調整市場（ΔkW） | **対象外と明記**。モデル化難度が高く、精度を装わない |
+| 託送料金 | `wheeling_fee_yen_per_kwh`（円/kWh、デフォルト0）。充電・放電の両方に対称適用する近似。2026-09-06にEPRX/OCCTO/JEPXの公開ページを実査したが、具体的な単価はトップページに掲載されておらず取引ガイド等のPDF内に格納されている可能性が高いため、精緻な制度区分（発電側/需要側課金の別）は追わず単一単価の近似に決定 |
+| FIPプレミアム | **実装しない（当初案から変更）**。FIPは再エネ特措法上「特定契約に係る再生可能エネルギー発電設備」が対象であり、発電を伴わない蓄電池単独設備はFIP認定の対象にならない。PV+蓄電池の組み合わせは既存の`simulate_fip_case_a/b`が担当する範囲であり、本モジュールは純粋な系統用（発電なし）蓄電池に限定 |
+| 容量市場収入 | `capacity_market_price_yen_per_kw_year`（円/kW/年、デフォルト0）× `battery_max_discharge_kw` の固定額。オークション実勢価格やデレーティングはモデル化しない |
+| 需給調整市場（ΔkW） | **対象外**（当初方針どおり）。2026-09-06にEPRX（`eprx.or.jp`）のページを確認したが、商品区分ごとの応動時間・拘束時間・実勢価格はトップページからは入手できず、モデル化難度が高いことを再確認 |
 
 ### 検証
-- 2〜4コマの手計算可能なミニケースでLPユニットテスト
-- 公表されている系統用蓄電池の事業性試算（例: 経産省・OCCTO資料）との突合を検討
+- `test_mcp_tools.py`に追加: validate正常系/異常系、wheeling feeがLP収益を減らすこと、
+  容量市場収益が単価×PCS容量と一致すること、実現率スイープでNPVが単調減少すること、
+  `battery_eol_action="end"`で蓄電池寿命到来後は容量市場収益も含め収益がゼロになること。
+  全PASS（既存のtest_phase3_smoke.py・test_mri_slide47.pyは無影響を再確認済み）
+- 公表されている系統用蓄電池の事業性試算（例: 経産省・OCCTO資料）との突合は今後の課題
+  （MRI資料のようなPV+蓄電池の突合先はあるが、系統用蓄電池単独の公開試算は未特定）
 
 ---
 
@@ -198,7 +205,7 @@ Claude (エージェント) ┼─ (MCP) ─ pv-sim-gh    … 家庭用需給
 |---|---|---|
 | **4a** ✅ | fip MCP化最小版: Gradio更新、`list_stations` / `get_jepx_stats` / `estimate_pv_generation` / `validate_fip_params` / `simulate_fip_case_a/b` | **完了（2026-08-31, commit f1d9bf4）**。本番Spaceで全6ツール動作確認（IRR 7.11%=ローカル一致）。UI回帰なし |
 | **4b** ✅ | ガードレール整備: 出力スキーマ統一、caveats同梱、`arbitrage_realization_rate_pct`（UI側にも追加）、入力上限 | **完了（2026-09-05）**。デフォルト85%、UI/MCP両方に実装。理論値/実現値を透明出力。`test_mcp_tools.py`で単調性・スコープ（蓄電池なし時は無効果）を検証 |
-| **4c** | 系統用蓄電池: 制度調査（託送・容量市場）→ LP実装 → `simulate_grid_battery` | ミニケースLP検証＋公表試算との突合 |
+| **4c** ✅ | 系統用蓄電池: 制度調査（託送・容量市場）→ LP実装 → `simulate_grid_battery` | **完了（2026-09-06）**。`optimize_grid_battery`/`build_cashflow_grid_battery`（app.py）＋`validate_grid_battery_params`/`simulate_grid_battery`（mcp_tools.py）実装。`test_mcp_tools.py`で正常系・異常系・パラメータ効果を検証、全PASS。公表試算との突合は未実施（突合先データ未特定） |
 | **4d** | 横展開: gh / biz を同パターンでMCP化（各リポジトリで実施） | 3サーバー同時接続で横断比較が動く |
 | **4e** | OSSドキュメント: MCP接続ガイド（日英）、活用例プロンプト集、READMEバッジ | 第三者がREADMEだけで接続・試算できる |
 
@@ -321,6 +328,17 @@ Codexが正しく提示し、ユーザーの明示確認を経てから本計算
       genのPaused状態はPhase 4a〜4eのどの段階にも支障がないことを確認。
       genのクォータ問題は本設計と切り離し、対応不要（将来必要になれば別途検討）。
 
-### 未確定（実装を進めながら解消）
-- [ ] 系統用蓄電池の託送料金の扱い（Phase 4cで制度調査を実施し、その結果を反映。
-      4a/4bの実装をブロックしない）
+### 決定済み（2026-09-06、Phase 4c着手時）
+- [x] 系統用蓄電池の託送料金の扱い = **円/kWh固定単価のユーザー入力**（充放電の往復に対称適用）。
+      完全にスコープ外にする案もあったが、蓄電池単独アービトラージの収益性を大きく左右する
+      要素であり、無視すると楽観的すぎる試算になるため採用（BG手数料と同じ簡易モデルの発想）
+- [x] 容量市場収益 = 円/kW/年の固定単価入力 × 定格放電出力。実勢価格の自動取得はせず、
+      デフォルト0円（未入力なら含まない）とし、精度の低い数値をデフォルトに埋め込まない方針
+- [x] 需給調整市場（EPRX1/2/3等）は明示的にスコープ外を維持。実査（eprx.or.jp）でも
+      トップページからは実勢価格・応動時間等の具体的パラメータが取得できないことを確認済み
+- [x] FIPプレミアムは系統用蓄電池モジュールには実装しない（発電を伴わない設備はFIP認定
+      対象外という制度理解に基づく、当初設計案からの修正）
+
+### 未確定（今後の課題）
+- [ ] 系統用蓄電池単独の公表試算（経産省・OCCTOの容量市場/需給調整市場資料等）との突合。
+      MRI資料はPV+蓄電池の突合には使えたが、系統用蓄電池単独の公開試算は未特定

@@ -657,6 +657,211 @@ def get_jepx_stats(area: str = "東京", fiscal_years: list[int] = [2023, 2024, 
     }
 
 
+def _normalize_and_validate_grid_battery(
+    jepx_area: str,
+    jepx_fiscal_years: list[int],
+    battery_capacity_kwh: float,
+    battery_max_charge_kw: float,
+    battery_max_discharge_kw: float,
+    battery_charge_efficiency_pct: float,
+    battery_discharge_efficiency_pct: float,
+    battery_soc_min_pct: float,
+    battery_soc_max_pct: float,
+    battery_life_years: int,
+    battery_degrade_pct_per_year: float,
+    battery_eol_action: str,
+    battery_replace_cost_ratio_pct: float,
+    battery_cost_yen_per_kwh: float,
+    subsidy_battery_pct: float,
+    om_ratio_pct_per_year: float,
+    battery_om_yen_per_kw_pcs_per_year: float,
+    decommission_pct: float,
+    equity_ratio_pct: float,
+    loan_interest_pct: float,
+    loan_years: int,
+    irr_period_years: int,
+    wheeling_fee_yen_per_kwh: float,
+    capacity_market_price_yen_per_kw_year: float,
+    arbitrage_realization_rate_pct: float,
+):
+    """系統用蓄電池（PVなし）パラメータを正規化し (params, warnings, errors) を返す。LPは実行しない。"""
+    app = _get_app()
+    errors = []
+    warnings = []
+
+    if jepx_area not in app.JEPX_AREAS:
+        errors.append(f"jepx_area は {app.JEPX_AREAS} から選択してください")
+    years = [int(y) for y in (jepx_fiscal_years or [])]
+    bad_years = [y for y in years if y not in app.JEPX_FISCAL_YEARS]
+    if not years:
+        errors.append("jepx_fiscal_years を1つ以上指定してください")
+    if bad_years:
+        errors.append(f"jepx_fiscal_years に未収録年度があります: {bad_years}（収録: {app.JEPX_FISCAL_YEARS}）")
+    if not (0 < battery_capacity_kwh <= MAX_BATTERY_KWH):
+        errors.append(f"battery_capacity_kwh は 0 < x <= {MAX_BATTERY_KWH:.0f} で指定してください")
+    if not (0 < battery_max_charge_kw <= MAX_PCS_KW):
+        errors.append(f"battery_max_charge_kw は 0 < x <= {MAX_PCS_KW:.0f} で指定してください")
+    if not (0 < battery_max_discharge_kw <= MAX_PCS_KW):
+        errors.append(f"battery_max_discharge_kw は 0 < x <= {MAX_PCS_KW:.0f} で指定してください")
+    if not (0 <= battery_soc_min_pct < battery_soc_max_pct <= 100):
+        errors.append("SOC範囲が不正です（0 <= soc_min < soc_max <= 100）")
+    for name, v in [("battery_charge_efficiency_pct", battery_charge_efficiency_pct),
+                    ("battery_discharge_efficiency_pct", battery_discharge_efficiency_pct)]:
+        if not (50 <= v <= 100):
+            errors.append(f"{name} は 50〜100 で指定してください")
+    if battery_eol_action not in _EOL_MAP:
+        errors.append('battery_eol_action は "replace"（交換）または "end"（終了）を指定してください')
+    if not (1 <= int(irr_period_years) <= 40):
+        errors.append("irr_period_years は 1〜40 で指定してください")
+    if not (0 <= arbitrage_realization_rate_pct <= 100):
+        errors.append("arbitrage_realization_rate_pct は 0〜100 で指定してください")
+    if wheeling_fee_yen_per_kwh < 0:
+        errors.append("wheeling_fee_yen_per_kwh は0以上で指定してください")
+    if capacity_market_price_yen_per_kw_year < 0:
+        errors.append("capacity_market_price_yen_per_kw_year は0以上で指定してください")
+
+    if 2022 in years:
+        warnings.append("2022年度はウクライナ危機による価格高騰年です（結果が楽観側に振れます）")
+    if battery_capacity_kwh > 0 and battery_max_charge_kw > battery_capacity_kwh:
+        warnings.append(
+            f"充電レート {battery_max_charge_kw:.0f}kW が容量 {battery_capacity_kwh:.0f}kWh を超えています"
+            "（1C超の高速蓄電池想定になっています）"
+        )
+    if wheeling_fee_yen_per_kwh == 0.0:
+        warnings.append("wheeling_fee_yen_per_kwh が0円です（託送料金を考慮しない楽観的な試算になります）")
+    if capacity_market_price_yen_per_kw_year == 0.0:
+        warnings.append("capacity_market_price_yen_per_kw_year が0円です（容量市場収益を含まない試算になります）")
+
+    params = {
+        "jepx_area": jepx_area,
+        "jepx_fiscal_years": years,
+        "battery_capacity_kwh": float(battery_capacity_kwh),
+        "battery_max_charge_kw": float(battery_max_charge_kw),
+        "battery_max_discharge_kw": float(battery_max_discharge_kw),
+        "battery_charge_efficiency_pct": float(battery_charge_efficiency_pct),
+        "battery_discharge_efficiency_pct": float(battery_discharge_efficiency_pct),
+        "battery_soc_min_pct": float(battery_soc_min_pct),
+        "battery_soc_max_pct": float(battery_soc_max_pct),
+        "battery_life_years": int(battery_life_years),
+        "battery_degrade_pct_per_year": float(battery_degrade_pct_per_year),
+        "battery_eol_action": battery_eol_action,
+        "battery_replace_cost_ratio_pct": float(battery_replace_cost_ratio_pct),
+        "battery_cost_yen_per_kwh": float(battery_cost_yen_per_kwh),
+        "subsidy_battery_pct": float(subsidy_battery_pct),
+        "om_ratio_pct_per_year": float(om_ratio_pct_per_year),
+        "battery_om_mode": "PCS_kW建て（三菱総研試算）",
+        "battery_om_yen_per_kw_pcs_per_year": float(battery_om_yen_per_kw_pcs_per_year),
+        "decommission_pct": float(decommission_pct),
+        "equity_ratio_pct": float(equity_ratio_pct),
+        "loan_interest_pct": float(loan_interest_pct),
+        "loan_years": int(loan_years),
+        "irr_period_years": int(irr_period_years),
+        "wheeling_fee_yen_per_kwh": float(wheeling_fee_yen_per_kwh),
+        "capacity_market_price_yen_per_kw_year": float(capacity_market_price_yen_per_kw_year),
+        "arbitrage_realization_rate_pct": float(arbitrage_realization_rate_pct),
+    }
+    return params, warnings, errors
+
+
+def _run_grid_battery_simulation(p: dict):
+    """検証済みパラメータ p で 系統用蓄電池シミュレーションを実行し、構造化dictを返す。"""
+    app = _get_app()
+    month_day = app.build_grid_battery_month_day()
+    jepx_prices = app.load_jepx_prices(p["jepx_area"], p["jepx_fiscal_years"], month_day)
+
+    opt = app.optimize_grid_battery(
+        jepx_prices,
+        capacity_kwh=p["battery_capacity_kwh"],
+        max_charge_kw=p["battery_max_charge_kw"],
+        max_discharge_kw=p["battery_max_discharge_kw"],
+        eff_charge_pct=p["battery_charge_efficiency_pct"],
+        eff_discharge_pct=p["battery_discharge_efficiency_pct"],
+        soc_min_pct=p["battery_soc_min_pct"],
+        soc_max_pct=p["battery_soc_max_pct"],
+        wheeling_fee_yen_per_kwh=p["wheeling_fee_yen_per_kwh"],
+    )
+
+    bat_capex = p["battery_capacity_kwh"] * p["battery_cost_yen_per_kwh"]
+    subsidy_bat = bat_capex * p["subsidy_battery_pct"] / 100.0
+    capacity_market_revenue = p["capacity_market_price_yen_per_kw_year"] * p["battery_max_discharge_kw"]
+
+    cf_result = app.build_cashflow_grid_battery(
+        bat_capex=bat_capex, subsidy_bat=subsidy_bat,
+        annual_arbitrage_revenue=opt["annual_arbitrage_revenue_yen"],
+        capacity_market_revenue_yen_per_year=capacity_market_revenue,
+        om_ratio_pct=p["om_ratio_pct_per_year"],
+        equity_ratio_pct=p["equity_ratio_pct"],
+        loan_interest_pct=p["loan_interest_pct"],
+        loan_years=p["loan_years"],
+        irr_period_years=p["irr_period_years"],
+        bat_life_years=p["battery_life_years"],
+        bat_degrade_pct_per_year=p["battery_degrade_pct_per_year"],
+        bat_eol_action=_EOL_MAP[p["battery_eol_action"]],
+        bat_replace_cost_ratio_pct=p["battery_replace_cost_ratio_pct"],
+        bat_om_mode=p["battery_om_mode"],
+        om_bat_per_kw_pcs=p["battery_om_yen_per_kw_pcs_per_year"],
+        bat_max_charge_kw=p["battery_max_charge_kw"],
+        decom_pct=p["decommission_pct"],
+        arbitrage_realization_rate_pct=p.get("arbitrage_realization_rate_pct", 100.0),
+    )
+
+    cashflow_rows = []
+    for r in cf_result["rows"]:
+        cashflow_rows.append({
+            "year": r["year"],
+            "revenue_yen": round(r["revenue"]),
+            "om_yen": round(r["om"]),
+            "debt_service_yen": round(r["debt_service"]),
+            "battery_replace_yen": round(r.get("battery_replace", 0.0)),
+            "decommission_yen": round(r.get("decom_cost", 0.0)),
+            "project_cf_yen": round(r["project_cf"]),
+            "net_cf_yen": round(r["net_cf"]),
+            "cum_project_cf_yen": round(r["cum_project"]),
+        })
+
+    irr = cf_result["project_irr"]
+    caveats = [
+        "本ツールはJEPXスポット市場での充放電アービトラージのみをLPで最適化しています"
+        "（1年分の価格を完全予見する理論上限。arbitrage_realization_rate_pctで実運用想定に補正）",
+        "容量市場収益は capacity_market_price_yen_per_kw_year × 定格放電出力 の固定額として"
+        "計上しており、入札行動やデレーティング（蓄電池の継続時間に応じた供出力の割引）は"
+        "モデル化していません。実勢価格はOCCTOの容量市場約定結果を参照してください",
+        "託送料金は wheeling_fee_yen_per_kwh 円/kWh を充電・放電の両方に対称適用する近似です。"
+        "実際はエリア・電圧階級・発電側/需要側課金の別で変動します",
+        "需給調整市場（EPRX1/2/3等の調整力公募）は対象外です。商品区分ごとに応動時間・"
+        "拘束時間が異なり、実勢価格データの入手も容易でないため、精度の低い金額を出すより"
+        "「対象外」と明示する方針としています（このツールはスポット市場のみが対象です）",
+        "JEPX価格は過去実績の平均であり、将来の市場価格を保証するものではありません",
+        "本結果は投資判断の参考情報であり、収益を保証するものではありません",
+    ]
+    if p["wheeling_fee_yen_per_kwh"] == 0.0:
+        caveats.append("wheeling_fee_yen_per_kwh=0円のため託送料金を考慮していません（収益が過大評価されます）")
+    if p["capacity_market_price_yen_per_kw_year"] == 0.0:
+        caveats.append("capacity_market_price_yen_per_kw_year=0円のため容量市場収益を含んでいません")
+
+    return {
+        "assumptions": p,
+        "kpis": {
+            "project_irr_pct": round(irr * 100, 2) if irr is not None else None,
+            "project_npv_yen": round(cf_result["project_npv"]),
+            "discount_rate_pct": p["loan_interest_pct"],
+            "payback_years": cf_result["payback_year"],
+            "net_capex_yen": round(cf_result["net_capex"]),
+            "annual_arbitrage_revenue_theoretical_yen": round(cf_result["arbitrage_value_theoretical_yen"]),
+            "annual_arbitrage_revenue_realized_yen": round(cf_result["arbitrage_value_realized_yen"]),
+            "annual_capacity_market_revenue_yen": round(capacity_market_revenue),
+            "arbitrage_realization_rate_pct": cf_result["arbitrage_realization_rate_pct"],
+        },
+        "annual": {
+            "battery_charge_kwh": round(opt["annual_charge_kwh"]),
+            "battery_discharge_kwh": round(opt["annual_discharge_kwh"]),
+            "equivalent_full_cycles": round(opt["equivalent_full_cycles"], 1),
+        },
+        "cashflow": cashflow_rows,
+        "caveats": caveats,
+    }
+
+
 def estimate_pv_generation(
     station_no: str = "44132",
     ppeak_kw: float = 1000.0,
@@ -1120,6 +1325,217 @@ def simulate_fip_case_b(
                 "warnings": v.get("warnings", [])}
     try:
         out = _run_fip_simulation("B", v["normalized_params"])
+        out["validation_warnings"] = v.get("warnings", [])
+        return out
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ============================================================
+# 系統用蓄電池（PVなし）単独モジュール — 公開MCPツール（Phase 4c）
+# ============================================================
+
+def validate_grid_battery_params(
+    jepx_area: str = "東京",
+    jepx_fiscal_years: list[int] = [2023, 2024, 2025],
+    battery_capacity_kwh: float = 1000.0,
+    battery_max_charge_kw: float = 500.0,
+    battery_max_discharge_kw: float = 500.0,
+    battery_charge_efficiency_pct: float = 95.0,
+    battery_discharge_efficiency_pct: float = 95.0,
+    battery_soc_min_pct: float = 10.0,
+    battery_soc_max_pct: float = 90.0,
+    battery_life_years: int = 20,
+    battery_degrade_pct_per_year: float = 1.0,
+    battery_eol_action: str = "replace",
+    battery_replace_cost_ratio_pct: float = 60.0,
+    battery_cost_yen_per_kwh: float = 68000.0,
+    subsidy_battery_pct: float = 0.0,
+    om_ratio_pct_per_year: float = 1.5,
+    battery_om_yen_per_kw_pcs_per_year: float = 5000.0,
+    decommission_pct: float = 5.0,
+    equity_ratio_pct: float = 30.0,
+    loan_interest_pct: float = 2.0,
+    loan_years: int = 15,
+    irr_period_years: int = 20,
+    wheeling_fee_yen_per_kwh: float = 0.0,
+    capacity_market_price_yen_per_kw_year: float = 0.0,
+    arbitrage_realization_rate_pct: float = 85.0,
+) -> dict:
+    """太陽光を伴わない系統用蓄電池単独事業のパラメータを検証する（即答・LP実行なし）。
+
+    JEPXスポット市場での充放電アービトラージ＋容量市場収益で事業性を評価するための
+    事前検証。**simulate_grid_battery を呼ぶ前に必ずこのツールで検証し、返ってきた
+    normalized_params をユーザーに提示して確認を得てから実行すること。**
+
+    スコープ（2026-09-06決定、CLAUDE.md参照）:
+      - 収益源はJEPXスポット市場での充放電アービトラージ（LP最適化）と
+        容量市場（円/kW/年の固定単価入力）の2つのみ
+      - 需給調整市場（EPRX1/2/3等の調整力公募）は対象外。商品区分ごとの応動時間・
+        拘束時間が複雑で実勢価格データの入手も容易でないため、精度の低い試算を出す
+        より「対象外」と明示する方針
+      - 託送料金は円/kWh固定単価の近似（充放電の往復に対称適用）
+
+    Args:
+        jepx_area: JEPXエリア名（北海道/東北/東京/中部/北陸/関西/中国/四国/九州）
+        jepx_fiscal_years: JEPX価格年度リスト（2020〜2025、複数年平均）。
+            get_jepx_stats で事前にエリア別スプレッドを確認すると良い
+        battery_capacity_kwh: 蓄電池容量 [kWh]
+        battery_max_charge_kw: 最大充電電力 [kW]
+        battery_max_discharge_kw: 最大放電電力 [kW]（容量市場収益の算定基礎にも使用）
+        battery_charge_efficiency_pct: 充電効率 [%]
+        battery_discharge_efficiency_pct: 放電効率 [%]
+        battery_soc_min_pct: SOC下限 [%]
+        battery_soc_max_pct: SOC上限 [%]
+        battery_life_years: 蓄電池寿命 [年]
+        battery_degrade_pct_per_year: 年間劣化率 [%/年]
+        battery_eol_action: 寿命到来時 "replace"=交換再投資 / "end"=蓄電池なしで終了
+        battery_replace_cost_ratio_pct: 交換時単価の当初比 [%]
+        battery_cost_yen_per_kwh: 蓄電池単価 [円/kWh]
+        subsidy_battery_pct: 補助率 [%]
+        om_ratio_pct_per_year: O&M費率 [%/年]（CAPEX比。battery_om_modeは常にPCS_kW建て
+            固定のため、この引数は将来CAPEX比モードを追加する場合の予約）
+        battery_om_yen_per_kw_pcs_per_year: 蓄電池O&M [円/kW(PCS)/年]
+        decommission_pct: 廃止措置費用 [補助前CAPEX×%、最終年計上]
+        equity_ratio_pct: 自己資本比率 [%]
+        loan_interest_pct: 借入金利 [%/年]
+        loan_years: 借入期間 [年]
+        irr_period_years: IRR計算期間 [年]
+        wheeling_fee_yen_per_kwh: 託送料金 [円/kWh]（充電・放電の両方に対称適用する近似。
+            デフォルト0=未考慮。0のままだと収益が過大評価される点に注意）
+        capacity_market_price_yen_per_kw_year: 容量市場単価 [円/kW/年]
+            （battery_max_discharge_kw に乗じて年間収益を算定。デフォルト0=容量市場収益を
+            含まない試算。実勢価格はOCCTOの容量市場約定結果を参照）
+        arbitrage_realization_rate_pct: 蓄電池アービトラージ実現率 [%]（デフォルト85。
+            完全予見LPの理論値を実運用（前日予測ベース）想定に補正）
+
+    Returns:
+        dict: {"valid": bool, "normalized_params": {...}, "warnings": [...], "errors": [...]}
+    """
+    try:
+        params, warnings, errors = _normalize_and_validate_grid_battery(
+            jepx_area, jepx_fiscal_years,
+            battery_capacity_kwh, battery_max_charge_kw, battery_max_discharge_kw,
+            battery_charge_efficiency_pct, battery_discharge_efficiency_pct,
+            battery_soc_min_pct, battery_soc_max_pct,
+            battery_life_years, battery_degrade_pct_per_year,
+            battery_eol_action, battery_replace_cost_ratio_pct,
+            battery_cost_yen_per_kwh, subsidy_battery_pct,
+            om_ratio_pct_per_year, battery_om_yen_per_kw_pcs_per_year,
+            decommission_pct, equity_ratio_pct,
+            loan_interest_pct, loan_years, irr_period_years,
+            wheeling_fee_yen_per_kwh, capacity_market_price_yen_per_kw_year,
+            arbitrage_realization_rate_pct,
+        )
+        return {
+            "valid": len(errors) == 0,
+            "normalized_params": params,
+            "warnings": warnings,
+            "errors": errors,
+            "estimated_runtime_seconds": "10-30（LPを含むが、PVを伴うFIPモデルより軽量）",
+            "next_step": "normalized_params をユーザーに提示して確認後、"
+                         "simulate_grid_battery を同じ引数で呼び出す",
+        }
+    except Exception as e:
+        return {"valid": False, "errors": [str(e)], "warnings": []}
+
+
+def simulate_grid_battery(
+    jepx_area: str = "東京",
+    jepx_fiscal_years: list[int] = [2023, 2024, 2025],
+    battery_capacity_kwh: float = 1000.0,
+    battery_max_charge_kw: float = 500.0,
+    battery_max_discharge_kw: float = 500.0,
+    battery_charge_efficiency_pct: float = 95.0,
+    battery_discharge_efficiency_pct: float = 95.0,
+    battery_soc_min_pct: float = 10.0,
+    battery_soc_max_pct: float = 90.0,
+    battery_life_years: int = 20,
+    battery_degrade_pct_per_year: float = 1.0,
+    battery_eol_action: str = "replace",
+    battery_replace_cost_ratio_pct: float = 60.0,
+    battery_cost_yen_per_kwh: float = 68000.0,
+    subsidy_battery_pct: float = 0.0,
+    om_ratio_pct_per_year: float = 1.5,
+    battery_om_yen_per_kw_pcs_per_year: float = 5000.0,
+    decommission_pct: float = 5.0,
+    equity_ratio_pct: float = 30.0,
+    loan_interest_pct: float = 2.0,
+    loan_years: int = 15,
+    irr_period_years: int = 20,
+    wheeling_fee_yen_per_kwh: float = 0.0,
+    capacity_market_price_yen_per_kw_year: float = 0.0,
+    arbitrage_realization_rate_pct: float = 85.0,
+) -> dict:
+    """太陽光を伴わない系統用蓄電池単独の事業性を試算する（実行10〜30秒、LP最適化を含む）。
+
+    JEPXスポット市場での充放電アービトラージをLPで解き、容量市場収益（固定入力）を
+    加えた上で Project IRR / NPV / 投資回収年数を返す。需給調整市場は対象外（理由は
+    validate_grid_battery_params のスコープ説明を参照）。
+
+    **事前に validate_grid_battery_params で検証し、パラメータをユーザーに
+    確認してから呼び出すこと。** 引数の意味は validate_grid_battery_params と同一。
+
+    Args:
+        jepx_area: JEPXエリア名
+        jepx_fiscal_years: JEPX価格年度リスト（複数年平均）
+        battery_capacity_kwh: 蓄電池容量 [kWh]
+        battery_max_charge_kw: 最大充電電力 [kW]
+        battery_max_discharge_kw: 最大放電電力 [kW]（容量市場収益の算定基礎にも使用）
+        battery_charge_efficiency_pct: 充電効率 [%]
+        battery_discharge_efficiency_pct: 放電効率 [%]
+        battery_soc_min_pct: SOC下限 [%]
+        battery_soc_max_pct: SOC上限 [%]
+        battery_life_years: 蓄電池寿命 [年]
+        battery_degrade_pct_per_year: 年間劣化率 [%/年]
+        battery_eol_action: 寿命到来時 "replace"=交換再投資 / "end"=蓄電池なしで終了
+        battery_replace_cost_ratio_pct: 交換時単価の当初比 [%]
+        battery_cost_yen_per_kwh: 蓄電池単価 [円/kWh]
+        subsidy_battery_pct: 補助率 [%]
+        om_ratio_pct_per_year: O&M費率 [%/年]（予約、現状PCS_kW建て固定）
+        battery_om_yen_per_kw_pcs_per_year: 蓄電池O&M [円/kW(PCS)/年]
+        decommission_pct: 廃止措置費用 [補助前CAPEX×%]
+        equity_ratio_pct: 自己資本比率 [%]
+        loan_interest_pct: 借入金利 [%/年]
+        loan_years: 借入期間 [年]
+        irr_period_years: IRR計算期間 [年]
+        wheeling_fee_yen_per_kwh: 託送料金 [円/kWh]（充放電の往復に対称適用する近似）
+        capacity_market_price_yen_per_kw_year: 容量市場単価 [円/kW/年]
+        arbitrage_realization_rate_pct: 蓄電池アービトラージ実現率 [%]（デフォルト85）
+
+    Returns:
+        dict: assumptions（入力エコー）/ kpis（IRR・NPV・回収年数・アービトラージ内訳）/
+              annual（充放電量・稼働サイクル数）/ cashflow（年次CF）/ caveats（免責事項）
+    """
+    v = validate_grid_battery_params(
+        jepx_area=jepx_area, jepx_fiscal_years=jepx_fiscal_years,
+        battery_capacity_kwh=battery_capacity_kwh,
+        battery_max_charge_kw=battery_max_charge_kw,
+        battery_max_discharge_kw=battery_max_discharge_kw,
+        battery_charge_efficiency_pct=battery_charge_efficiency_pct,
+        battery_discharge_efficiency_pct=battery_discharge_efficiency_pct,
+        battery_soc_min_pct=battery_soc_min_pct,
+        battery_soc_max_pct=battery_soc_max_pct,
+        battery_life_years=battery_life_years,
+        battery_degrade_pct_per_year=battery_degrade_pct_per_year,
+        battery_eol_action=battery_eol_action,
+        battery_replace_cost_ratio_pct=battery_replace_cost_ratio_pct,
+        battery_cost_yen_per_kwh=battery_cost_yen_per_kwh,
+        subsidy_battery_pct=subsidy_battery_pct,
+        om_ratio_pct_per_year=om_ratio_pct_per_year,
+        battery_om_yen_per_kw_pcs_per_year=battery_om_yen_per_kw_pcs_per_year,
+        decommission_pct=decommission_pct, equity_ratio_pct=equity_ratio_pct,
+        loan_interest_pct=loan_interest_pct, loan_years=loan_years,
+        irr_period_years=irr_period_years,
+        wheeling_fee_yen_per_kwh=wheeling_fee_yen_per_kwh,
+        capacity_market_price_yen_per_kw_year=capacity_market_price_yen_per_kw_year,
+        arbitrage_realization_rate_pct=arbitrage_realization_rate_pct,
+    )
+    if not v.get("valid"):
+        return {"error": "パラメータ検証エラー", "errors": v.get("errors", []),
+                "warnings": v.get("warnings", [])}
+    try:
+        out = _run_grid_battery_simulation(v["normalized_params"])
         out["validation_warnings"] = v.get("warnings", [])
         return out
     except Exception as e:
