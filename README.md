@@ -16,6 +16,7 @@ license: mit
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Gradio](https://img.shields.io/badge/Gradio-6.26-orange)](https://gradio.app/)
+[![MCP Compatible](https://img.shields.io/badge/MCP-compatible-9cf)](docs/mcp_guide.md)
 
 A web-based simulator for **utility-scale Solar PV + battery storage business cases under Japan's FIP (Feed-in Premium) scheme**. Built on JIS C 8907 generation modeling, NEDO METPV-20 weather data for 77 Japanese sites, JEPX spot-market price database (9 areas × 6 fiscal years), and PuLP/CBC linear programming for optimal 30-minute battery dispatch over 17,520 timeslots per year.
 
@@ -79,7 +80,7 @@ A web-based simulator for **utility-scale Solar PV + battery storage business ca
 ## 🛠 Tech Stack / 技術スタック
 
 - **Language**: Python 3.10+
-- **UI**: Gradio 5.23
+- **UI**: Gradio 6.26（MCP対応 / MCP-enabled）
 - **Plotting**: Plotly
 - **Solar modeling**: pvlib (Erbs, isotropic transposition, infinite_sheds for bifacial)
 - **Optimization**: PuLP + CBC (linear programming, 17,520 timeslots)
@@ -112,18 +113,42 @@ The Gradio UI will start at `http://127.0.0.1:7860`.
 
 ---
 
+## 🤖 Use from an AI Agent (MCP) / AIエージェントから使う（MCP対応）
+
+This Space exposes its calculations as an [MCP](https://modelcontextprotocol.io/) server. Any MCP-compatible AI agent (Claude Code, Claude Desktop, OpenAI Codex CLI, etc.) can call it directly with natural language — no manual UI clicking required. It also connects cleanly alongside the [pv-sim-gh](https://huggingface.co/spaces/hachinai/pv-sim-gh) and [pv-sim-biz](https://huggingface.co/spaces/hachinai/pv-sim-biz) servers at the same time (tool names are auto-namespaced per Space, e.g. `pv_sim_fip_list_stations`) — no hub app needed.
+
+本Spaceは計算機能を [MCP](https://modelcontextprotocol.io/) サーバーとして公開しています。Claude Code・Claude Desktop・OpenAI Codex CLI など MCP対応の任意のAIエージェントから、自然言語のまま直接呼び出せます。[pv-sim-gh](https://huggingface.co/spaces/hachinai/pv-sim-gh)・[pv-sim-biz](https://huggingface.co/spaces/hachinai/pv-sim-biz) と同時接続しても、ツール名がSpace単位で自動的に名前空間化される（例: `pv_sim_fip_list_stations`）ためハブアプリなしで横断利用できます。
+
+**Endpoint:** `https://hachinai-pv-sim-fip.hf.space/gradio_api/mcp/`
+
+**Tools:** `list_stations` / `get_jepx_stats` / `estimate_pv_generation` / `validate_fip_params` → `simulate_fip_case_a` / `simulate_fip_case_b` / `validate_grid_battery_params` → `simulate_grid_battery`
+
+```bash
+# Claude Code
+claude mcp add --scope user --transport http pv-sim-fip https://hachinai-pv-sim-fip.hf.space/gradio_api/mcp/
+```
+
+→ Full setup guide (Claude Desktop / OpenAI Codex CLI) and ready-to-paste example prompts:
+**[docs/mcp_guide.md](docs/mcp_guide.md)** ・ **[docs/example_prompts.md](docs/example_prompts.md)**
+
+---
+
 ## 📂 Repository Structure / リポジトリ構成
 
 ```
 pv-sim-fip/
-├── app.py                      # Main application (standalone Gradio app)
+├── app.py                      # Main application (Gradio UI + calculation engine)
+├── mcp_tools.py                # MCP tool definitions (validate/simulate API layer)
 ├── radiation.db                # NEDO METPV-20 weather DB, 77 sites (Git LFS)
 ├── jepx.db                     # JEPX spot price DB, 9 areas × 6 FYs (Git LFS)
 ├── requirements.txt
 ├── README.md                   # This file
 ├── LICENSE                     # MIT
 └── docs/
-    └── architecture.md         # Detailed architecture & implementation notes
+    ├── architecture.md         # Detailed architecture & implementation notes
+    ├── agent_design.md         # Phase 4 MCP integration design doc (all 3 sister projects)
+    ├── mcp_guide.md             # MCP connection guide (bilingual)
+    └── example_prompts.md      # Ready-to-paste example prompts
 ```
 
 ---
