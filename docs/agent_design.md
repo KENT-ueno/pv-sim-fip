@@ -316,6 +316,15 @@ Codexが正しく提示し、ユーザーの明示確認を経てから本計算
   分けて評価する必要がある。無料〜手元のプランで試せる代替経路（今回はCodexのローカル
   プロジェクト）を探す判断が実務上重要だった。
 
+### pv-sim-gh（Phase 4d）でも再検証（2026-09-06）
+LP不使用（貪欲法蓄電池シミュレーション）のpv-sim-ghでも同様にCodex経由で検証。
+東京44132・5kW・PCS5.5kW・電気+ガス併用・蓄電池5kWhの条件で`simulate_residential_pv`を
+実行し、`generation_kwh`(5,416)・`self_consumption_rate_pct`(55.4%)・`battery_charge_kwh`
+(1,144)・`battery_discharge_kwh`(1,032)・`gas_electric_scenario.payback_years`(17.1年)の
+5項目すべてがローカル/本番の確認値と完全一致。LPベース（fip）だけでなく貪欲法ベース（gh）
+でも異種プラットフォーム間の再現性が確認され、「MCPは標準プロトコルなのでどのエージェント
+から呼んでも同じ結果になる」という主張が2つ目のモジュールでも裏付けられた。
+
 ---
 
 ## 9. 決定事項・未確定事項
