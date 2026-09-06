@@ -206,7 +206,11 @@ LP自体の複雑さはむしろ縮小している（決定変数3種→3種だ�
 | **4a** ✅ | fip MCP化最小版: Gradio更新、`list_stations` / `get_jepx_stats` / `estimate_pv_generation` / `validate_fip_params` / `simulate_fip_case_a/b` | **完了（2026-08-31, commit f1d9bf4）**。本番Spaceで全6ツール動作確認（IRR 7.11%=ローカル一致）。UI回帰なし |
 | **4b** ✅ | ガードレール整備: 出力スキーマ統一、caveats同梱、`arbitrage_realization_rate_pct`（UI側にも追加）、入力上限 | **完了（2026-09-05）**。デフォルト85%、UI/MCP両方に実装。理論値/実現値を透明出力。`test_mcp_tools.py`で単調性・スコープ（蓄電池なし時は無効果）を検証 |
 | **4c** ✅ | 系統用蓄電池: 制度調査（託送・容量市場）→ LP実装 → `simulate_grid_battery` | **完了（2026-09-06）**。`optimize_grid_battery`/`build_cashflow_grid_battery`（app.py）＋`validate_grid_battery_params`/`simulate_grid_battery`（mcp_tools.py）実装。`test_mcp_tools.py`で正常系・異常系・パラメータ効果を検証、全PASS。**同日、別セッション（Opus経由）によるMCP実測レビューを2回受けて対応**: ①p.44/p.50突合（劣化率のサイクル数依存化を実装、他は出力表現の明確化・記録）、②p.36「シナリオ別収益性構造比較」突合（固定資産税・発電側課金・再エネ賦課金・託送kW建ての4費用項目を追加。うち託送kW建てはMRI引用値がMRI自身のチャート実測値と10倍不整合と判明したため、デフォルト0円のまま未反映）。バグは検出されず、いずれもモデル前提・費用項目の過不足。詳細はCLAUDE.md参照。純アービトラージ収益は当社4.98万円/kWh・MRI 4.97万円/kWh（差0.2%）で一致、費用項目追加後のIRRはMRIベース-1.50%に対し-1.08%まで接近（残差0.42pt） |
-| **4d** 🔶 | 横展開: gh / biz を同パターンでMCP化（各リポジトリで実施） | **pv-sim-gh 完了（2026-09-06, commit 2b573be）**。`list_stations`/`estimate_pv_generation`/`validate_residential_params`/`simulate_residential_pv`の4ツールを実装。LPを使わない貪欲法蓄電池シミュレーション（30分×365日）のため実行は数秒〜十数秒と軽量。既知の制約: 経済性比較エンジン（`calc_annual_economics`）が蓄電池による自家消費率向上を反映していない（既存app.pyの仕様のまま踏襲、caveatsで明記）。ローカル全テストPASS・ブラウザUI動作確認済み・本番検証済み（HF無料枠のCPU Basicクォータ上限に抵触しpv-sim-ghがPaused状態になったため、pv-sim-ge＝pv-sim-genを一時停止して枠を確保。本番の生成量・自家消費率・投資回収年数がローカルと完全一致）。pv-sim-biz は未着手。3サーバー同時接続での横断比較はbiz完了後に確認 |
+| **4d** 🔶 | 横展開: gh / biz を同パターンでMCP化（各リポジトリで実施） | **pv-sim-gh 完了（2026-09-06, commit 2b573be）**。`list_stations`/`estimate_pv_generation`/`validate_residential_params`/`simulate_residential_pv`の4ツールを実装。LPを使わない貪欲法蓄電池シミュレーション（30分×365日）のため実行は数秒〜十数秒と軽量。既知の制約: 経済性比較エンジン（`calc_annual_economics`）が蓄電池による自家消費率向上を反映していない（既存app.pyの仕様のまま踏襲、caveatsで明記）。ローカル全テストPASS・ブラウザUI動作確認済み・本番検証済み（HF無料枠のCPU Basicクォータ上限に抵触しpv-sim-ghがPaused状態になったため、pv-sim-ge＝pv-sim-genを一時停止して枠を確保。本番の生成量・自家消費率・投資回収年数がローカルと完全一致）。**pv-sim-biz 完了（2026-09-06, commit 6fd04ac→e4efb1f）**。`list_stations`/`estimate_pv_generation`/`validate_industrial_params`/`simulate_industrial_pv`の4ツールを実装。
+  - **4d-1（6fd04ac）**: 単体/複数施設合算需要・蓄電池（ルールベース or LP最適化、17,520コマ）・高圧/特別高圧料金の導入前後比較・投資回収・事業モデル（自己所有/リース/PPA、目標P-IRRはCRF逆算の内部入力のみでリース料/PPA単価に変換して公開し需要家向け出力には算出済みP-IRRとして出さない）に対応。
+  - **4d-2（e4efb1f）**: 両面パネル（bifacial/gcr/panel_height_m/pitch_m/積雪アルベド自動切替）とマイクログリッド事業（モードB。自営線費用・束ねメリット・網内売電収入・P-IRR。モードBはP-IRRをそのまま開示——モードA/PPAとは公開方針が異なる点に注意）を追加。app.run_simulationの直接呼び出し結果と1件単位で完全一致することを検証（`test_mcp_tools.py`に16項目追加、既存回帰テスト全PASS）。
+  - 未対応: 最適容量探索（2〜3分かかるグリッドサーチ）はcaveatsに明記のうえ引き続き対象外。
+  - ローカル全テストPASS・HTTP経由でローカル/本番結果が完全一致・ブラウザUI回帰なし・Codex経由の本番検証でも完全一致（4d-1部分。詳細は本節末尾）。3サーバー（fip/gh/biz）同時接続での横断比較は今後の課題 |
 | **4e** | OSSドキュメント: MCP接続ガイド（日英）、活用例プロンプト集、READMEバッジ | 第三者がREADMEだけで接続・試算できる |
 
 各Phaseは独立してデプロイ可能。4aで価値検証してから先へ進む。
@@ -324,6 +328,25 @@ LP不使用（貪欲法蓄電池シミュレーション）のpv-sim-ghでも同
 5項目すべてがローカル/本番の確認値と完全一致。LPベース（fip）だけでなく貪欲法ベース（gh）
 でも異種プラットフォーム間の再現性が確認され、「MCPは標準プロトコルなのでどのエージェント
 から呼んでも同じ結果になる」という主張が2つ目のモジュールでも裏付けられた。
+
+### pv-sim-biz（Phase 4d）でも再検証（Codex、2026-09-06）
+産業用（高圧・特別高圧）自家消費+蓄電池のpv-sim-bizでも同様にCodex経由で検証。
+福岡82182・病院22,400m²・PV800kW・蓄電池300kWh（LP最適化、`battery_mode=lp_optimized`）・
+リース事業モデル（契約年数15年・目標P-IRR12%、FIT経過3年目）の条件で
+`validate_industrial_params`→`simulate_industrial_pv`を実行（余剰売電/逆潮流禁止の
+両モード）。`generation_kwh`(804,919)・`self_consumption_rate_pct`(95.5%)・
+`battery_charge_kwh`(27,714)・`battery_discharge_kwh`(25,012)・
+`co2_reduction_t_per_year`(331.268)・`annual_economic_merit_yen`
+（余剰売電21,575,289円・逆潮流禁止20,936,634円）・`required_lease_yen_per_year`
+(23,750,289円)・`customer_annual_benefit_yen`（余剰売電-2,175,000円・逆潮流禁止
+-2,813,655円）・`proposal_viable`（両モードともfalse）の全項目がローカル直接呼び出し・
+本番の確認値と1件単位で完全一致。異常系（`building_type="warehouse"`など未収録の
+建物タイプ）でも正規化エラーメッセージがそのまま伝わることを確認。fip（完全予見LP＋
+市場アービトラージ）・gh（貪欲法、LP不使用）に続き、fipとは目的関数が異なる
+（コスト最小化＋ピークシェービング）LP最適化を持つ第3の実装でも異種プラットフォーム間の
+再現性が確認された。事業モデル（リース/PPA）のCRF逆算ロジックも初めてMCP経由で
+検証され、目標P-IRRが需要家向け出力に算出済みP-IRRとして漏れず、リース料/PPA単価・
+需要家メリット額のみが返る設計どおりの挙動が確認できた。
 
 ---
 
