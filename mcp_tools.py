@@ -34,6 +34,25 @@ def _get_app():
     import app
     return app
 
+
+def _jsonable(o):
+    """戻り値をJSON標準の型（dict/list/str/int/float/bool/None）に揃える。
+
+    numpy のスカラー/配列が混ざるとMCP経由で数値が文字列になる（`round()` は入力が
+    numpy.float64 のとき結果も numpy.float64 のまま返し、GradioのMCP応答はこの型を
+    数値として出力せず文字列化する）。公開ツールの戻り値は必ずこれを通す。
+    """
+    if isinstance(o, dict):
+        return {(k.item() if isinstance(k, np.generic) else k): _jsonable(v)
+                for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_jsonable(v) for v in o]
+    if isinstance(o, np.generic):
+        return o.item()
+    if isinstance(o, np.ndarray):
+        return _jsonable(o.tolist())
+    return o
+
 # ============================================================
 # 定数
 # ============================================================
@@ -605,14 +624,14 @@ def list_stations() -> dict:
         "SELECT point_no, point_name, lat, lon FROM points ORDER BY point_no"
     ).fetchall()
     conn.close()
-    return {
+    return _jsonable({
         "stations": [
             {"station_no": str(no), "name": name,
              "latitude": float(lat), "longitude": float(lon)}
             for no, name, lat, lon in rows
         ],
         "count": len(rows),
-    }
+    })
 
 
 def get_jepx_stats(area: str = "東京", fiscal_years: list[int] = [2023, 2024, 2025]) -> dict:
@@ -630,11 +649,11 @@ def get_jepx_stats(area: str = "東京", fiscal_years: list[int] = [2023, 2024, 
     """
     app = _get_app()
     if area not in app.JEPX_AREAS:
-        return {"error": f"area は {app.JEPX_AREAS} から選択してください"}
+        return _jsonable({"error": f"area は {app.JEPX_AREAS} から選択してください"})
     years = [int(y) for y in (fiscal_years or [])]
     bad = [y for y in years if y not in app.JEPX_FISCAL_YEARS]
     if not years or bad:
-        return {"error": f"fiscal_years は {app.JEPX_FISCAL_YEARS} の中から1つ以上指定してください"}
+        return _jsonable({"error": f"fiscal_years は {app.JEPX_FISCAL_YEARS} の中から1つ以上指定してください"})
 
     conn = sqlite3.connect(app.JEPX_DB_PATH)
     ph = ",".join(["?"] * len(years))
@@ -659,7 +678,7 @@ def get_jepx_stats(area: str = "東京", fiscal_years: list[int] = [2023, 2024, 
     spreads = np.array([max(v) - min(v) for v in by_date.values()])
     slot_avg = np.divide(slot_sum, np.maximum(slot_cnt, 1))
 
-    return {
+    return _jsonable({
         "area": area,
         "fiscal_years": years,
         "annual_avg_yen_per_kwh": round(float(arr.mean()), 2),
@@ -673,7 +692,7 @@ def get_jepx_stats(area: str = "東京", fiscal_years: list[int] = [2023, 2024, 
         "slot_avg_yen_per_kwh": [round(float(v), 2) for v in slot_avg],
         "note": "slot_avg は slot1=0:00-0:30 〜 slot48=23:30-24:00。"
                 "avg_daily_spread が蓄電池アービトラージ1kWhあたり原資の目安",
-    }
+    })
 
 
 def _normalize_and_validate_grid_battery(
@@ -1015,7 +1034,7 @@ def estimate_pv_generation(
     app = _get_app()
     try:
         if not (0 < ppeak_kw <= MAX_PPEAK_KW):
-            return {"error": f"ppeak_kw は 0 < x <= {MAX_PPEAK_KW:.0f}"}
+            return _jsonable({"error": f"ppeak_kw は 0 < x <= {MAX_PPEAK_KW:.0f}"})
         lat, lon, ghi_df, temp_df, name = _resolve_station(station_no)
         faces = [{
             "ppeak": float(ppeak_kw), "orientation": "南",
@@ -1028,7 +1047,7 @@ def estimate_pv_generation(
             app.DEFAULT_KPA, app.DEFAULT_ETA_INO,
             app.DEFAULT_ALPHA, app.DEFAULT_DELTA_T,
         )
-        return {
+        return _jsonable({
             "station_no": str(station_no),
             "station_name": name,
             "ppeak_kw": float(ppeak_kw),
@@ -1036,9 +1055,9 @@ def estimate_pv_generation(
             "capacity_factor_pct": round(g["annual"] / (ppeak_kw * 8760) * 100, 2),
             "monthly_generation_kwh": {str(m): round(g["monthly"].get(m, 0)) for m in range(1, 13)},
             "note": "JIS C 8907準拠（標準補正係数使用）。蓄電池・出力制御・経済性は含まない",
-        }
+        })
     except Exception as e:
-        return {"error": str(e)}
+        return _jsonable({"error": str(e)})
 
 
 def validate_fip_params(
@@ -1156,7 +1175,7 @@ def validate_fip_params(
     try:
         case = str(case).upper()
         if case not in ("A", "B"):
-            return {"valid": False, "errors": ['case は "A" または "B" を指定してください'], "warnings": []}
+            return _jsonable({"valid": False, "errors": ['case は "A" または "B" を指定してください'], "warnings": []})
         params, warnings, errors = _normalize_and_validate(
             case, station_no, ppeak_kw, tilt_deg, azimuth_deg, pcs_limit_kw,
             battery_capacity_kwh, battery_max_charge_kw, battery_max_discharge_kw,
@@ -1177,7 +1196,7 @@ def validate_fip_params(
             pv_degrade_pct_per_year, arbitrage_realization_rate_pct,
             property_tax_rate_pct, property_tax_residual_ratio_pct,
         )
-        return {
+        return _jsonable({
             "valid": len(errors) == 0,
             "normalized_params": params,
             "warnings": warnings,
@@ -1185,9 +1204,9 @@ def validate_fip_params(
             "estimated_runtime_seconds": "30-90（LP最適化を含むため）",
             "next_step": "normalized_params をユーザーに提示して確認後、"
                          "simulate_fip_case_a または simulate_fip_case_b を同じ引数で呼び出す",
-        }
+        })
     except Exception as e:
-        return {"valid": False, "errors": [str(e)], "warnings": []}
+        return _jsonable({"valid": False, "errors": [str(e)], "warnings": []})
 
 
 def simulate_fip_case_a(
@@ -1320,14 +1339,14 @@ def simulate_fip_case_a(
         property_tax_residual_ratio_pct=property_tax_residual_ratio_pct,
     )
     if not v.get("valid"):
-        return {"error": "パラメータ検証エラー", "errors": v.get("errors", []),
-                "warnings": v.get("warnings", [])}
+        return _jsonable({"error": "パラメータ検証エラー", "errors": v.get("errors", []),
+                "warnings": v.get("warnings", [])})
     try:
         out = _run_fip_simulation("A", v["normalized_params"])
         out["validation_warnings"] = v.get("warnings", [])
-        return out
+        return _jsonable(out)
     except Exception as e:
-        return {"error": str(e)}
+        return _jsonable({"error": str(e)})
 
 
 def simulate_fip_case_b(
@@ -1477,14 +1496,14 @@ def simulate_fip_case_b(
         property_tax_residual_ratio_pct=property_tax_residual_ratio_pct,
     )
     if not v.get("valid"):
-        return {"error": "パラメータ検証エラー", "errors": v.get("errors", []),
-                "warnings": v.get("warnings", [])}
+        return _jsonable({"error": "パラメータ検証エラー", "errors": v.get("errors", []),
+                "warnings": v.get("warnings", [])})
     try:
         out = _run_fip_simulation("B", v["normalized_params"])
         out["validation_warnings"] = v.get("warnings", [])
-        return out
+        return _jsonable(out)
     except Exception as e:
-        return {"error": str(e)}
+        return _jsonable({"error": str(e)})
 
 
 # ============================================================
@@ -1624,7 +1643,7 @@ def validate_grid_battery_params(
             generator_side_wheeling_yen_per_kw_month, renewable_energy_levy_yen_per_kwh,
             wheeling_fee_yen_per_kw_month,
         )
-        return {
+        return _jsonable({
             "valid": len(errors) == 0,
             "normalized_params": params,
             "warnings": warnings,
@@ -1632,9 +1651,9 @@ def validate_grid_battery_params(
             "estimated_runtime_seconds": "10-30（LPを含むが、PVを伴うFIPモデルより軽量）",
             "next_step": "normalized_params をユーザーに提示して確認後、"
                          "simulate_grid_battery を同じ引数で呼び出す",
-        }
+        })
     except Exception as e:
-        return {"valid": False, "errors": [str(e)], "warnings": []}
+        return _jsonable({"valid": False, "errors": [str(e)], "warnings": []})
 
 
 def simulate_grid_battery(
@@ -1755,11 +1774,11 @@ def simulate_grid_battery(
         wheeling_fee_yen_per_kw_month=wheeling_fee_yen_per_kw_month,
     )
     if not v.get("valid"):
-        return {"error": "パラメータ検証エラー", "errors": v.get("errors", []),
-                "warnings": v.get("warnings", [])}
+        return _jsonable({"error": "パラメータ検証エラー", "errors": v.get("errors", []),
+                "warnings": v.get("warnings", [])})
     try:
         out = _run_grid_battery_simulation(v["normalized_params"])
         out["validation_warnings"] = v.get("warnings", [])
-        return out
+        return _jsonable(out)
     except Exception as e:
-        return {"error": str(e)}
+        return _jsonable({"error": str(e)})
