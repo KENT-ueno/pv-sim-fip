@@ -40,7 +40,7 @@ servers at once never causes a name collision.*
 |---|---|---|
 | pv-sim-fip | `https://hachinai-pv-sim-fip.hf.space/gradio_api/mcp/` | FIP転＋蓄電池（新規/既存FIT転）、系統用蓄電池単独（PVなし） |
 | pv-sim-gh | `https://hachinai-pv-sim-gh.hf.space/gradio_api/mcp/` | 住宅用PV＋蓄電池＋需給＋経済性比較 |
-| pv-sim-biz | `https://hachinai-pv-sim-biz.hf.space/gradio_api/mcp/` | 産業用（高圧/特別高圧）自家消費＋マイクログリッド |
+| pv-sim-biz | `https://hachinai-pv-sim-biz.hf.space/gradio_api/mcp/` | 産業用（高圧/特別高圧）自家消費＋マイクログリッド、データセンター（IT負荷×PUE、系統受電上限） |
 
 ### ツール一覧 / Tools
 
@@ -55,7 +55,8 @@ servers at once never causes a name collision.*
 
 **pv-sim-biz** (`pv_sim_biz_` prefix):
 `list_stations` / `estimate_pv_generation` /
-`validate_industrial_params` → `simulate_industrial_pv`
+`validate_industrial_params` → `simulate_industrial_pv` /
+`estimate_dc_demand` / `validate_dc_params` → `simulate_dc`（データセンター）
 
 （`A → B` は「Aで検証してからBを呼ぶ」設計であることを示す。詳細は§4参照）
 *(`A → B` denotes "validate with A, then call B" — see §4 for why.)*
@@ -151,6 +152,13 @@ Claude Code と OpenAI Codex CLI の両方から接続し、同一パラメー�
 
 *Verified from both Claude Code and OpenAI Codex CLI — results match to the yen
 across all three servers. See [agent_design.md §8.5](./agent_design.md) for details.*
+
+pv-sim-biz のデータセンター用ツール（`estimate_dc_demand` / `validate_dc_params` / `simulate_dc`、2026-09追加）は、
+MCPプロトコル層（`initialize` → `tools/list` → `tools/call`）でローカル直接呼び出しとの一致を確認済みです。
+Codex からの自然言語での実機検証は 2026-09-20 に実施し、全シナリオでローカルの計算値と一致しました（Claude Code からの実機検証も同日に実施し、全シナリオで一致。手順書は pv-sim-biz の `docs/dc_agent_verification.md`）。
+
+*The data center tools of pv-sim-biz (added 2026-09) are verified at the MCP protocol layer against local direct calls;
+end-to-end verification from both Codex and Claude Code (2026-09-20) matched the local values in all scenarios — see pv-sim-biz `docs/dc_agent_verification.md`.*
 
 ---
 

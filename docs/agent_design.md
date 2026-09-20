@@ -348,6 +348,47 @@ LP不使用（貪欲法蓄電池シミュレーション）のpv-sim-ghでも同
 検証され、目標P-IRRが需要家向け出力に算出済みP-IRRとして漏れず、リース料/PPA単価・
 需要家メリット額のみが返る設計どおりの挙動が確認できた。
 
+### pv-sim-biz データセンター用ツール（Phase 7 段階4、2026-09-20）— プロトコル層・Codex・Claude Code で検証済み
+pv-sim-bizに`estimate_dc_demand` / `validate_dc_params` → `simulate_dc`を追加した（需要をIT負荷×PUEから生成し、
+以降は産業用と同じ計算経路。系統受電上限をLPで強制し、守れない場合は`error`でなく`grid_cap_infeasible`の診断を返す）。
+
+**MCPプロトコル層の検証（実施済み）**: 汎用MCPクライアント相当（`initialize` → `tools/list` → `tools/call`、
+プロトコル2025-03-26）で本番に接続し、名前付き引数だけで呼び（エージェントの呼び方）、ローカルの直接呼び出しと
+突き合わせた。需要見積り・受電上限1,190kW＋LP・上限を守れない診断の3ケースが全項目一致、不正入力は`error`/`errors`で
+返り計算は実行されない。ツールは7つ。
+
+**Codex での実機検証（実施済み、2026-09-20）**: 4シナリオ（需要見積り／受電上限を守れる／守れない診断／異常系）を
+自然言語で試算し、ローカルの計算値（期待値）と突き合わせた。**全シナリオで全項目が一致**。
+- S1 `estimate_dc_demand`: 年間IT電力量15,768,000 kWh・施設20,498,400 kWh・ピーク2,501.8 kW・申請受電容量3,734 kW（注記込み）
+- S2 `validate_dc_params`→`simulate_dc`（札幌・IT1,000kW・PV1,000kW・蓄電池2,000kWh・上限1,190kW）: 受電上限は`enforced`、
+  導入前1,207.4→導入後1,115.3kW、発電1,007,698 kWh、系統購入8,809,655 kWh、コスト削減25,407,417円、CO2 431.666 t。
+  警告（LPの所要時間）もCodexが実行前に提示
+- S3 上限を守れない条件: **エラーでなく診断**（`grid_cap_infeasible=true`、違反はpower・energy、下限5,496.6kW）。
+  「蓄電池を大きくしても解決しません」という要点をCodexが判断として伝え、次の一手も案内した
+- S4 異常系: 計算せず、有効な選択肢とPUEの下限を提示
+- 産業用（福岡・病院・LP・リース）も2026-09-06の参照値と全項目一致
+
+2段階プロトコル（validate→提示→確認→simulate）と、警告・caveatsの伝達は、ツールのdocstringだけで期待どおり動いた。
+結果は「診断（できない）」を`error`にせず**結果として返す**設計が、エージェントの説明の質（理由と次の一手）につながることを示した。
+**Claude Code での実機検証（実施済み、2026-09-20）**: リポジトリ外の空フォルダの新規セッションで、`pv-sim-biz` のMCPだけを
+登録し、同じ4シナリオを**前置きなし**で貼付。**全シナリオで全項目が一致**した。2段階プロトコル（list_stations→validate→
+正規化パラメータの提示→確認→simulate）はツールのdocstringだけで守られ、用途（AI学習→`ai_training`）と地点（札幌→14163）の推定、
+PCS上限のPV容量への合わせ込み、診断（`grid_cap_infeasible`）の読み解き、caveats・警告（契約種別の目安）の反映も適切だった。
+**Codex・Claude Code の双方で実測一致**（設計書の Phase 4 完了条件）。手順・期待値・結果は pv-sim-biz の `docs/dc_agent_verification.md`。
+
+**教訓（型）**: `capacity_factor_pct`が`numpy.float64`のまま返り、MCP経由だと数値でなく**文字列**（`"11.5"`）に
+なっていた。ローカルの直接呼び出し・HTTPの`/call`では数値として比較が通るため、上のCodex検証（fip/gh/biz）では
+気づけなかった。**プロトコル層で型まで見ない限り検出できない**。MCPツールは戻り値をJSON標準の型（`float`/`int`/`str`）に
+してから返すこと（`round()`しても`numpy.float64`のままになる）。**横展開（2026-09-20、完了・本番で確認済み）**:
+pv-sim-fip・pv-sim-gh の `estimate_pv_generation` も `capacity_factor_pct` が文字列（fip `"12.19"`／gh `"12.37"`）で
+返っていた。gh は加えて `simulate_residential_pv` の `economics.all_electric_scenario.payback_years`（`"14.7"`）も文字列だった。
+**3リポジトリとも、公開ツールの `return` を `_jsonable()`（numpy のスカラー・配列・辞書キーをJSON標準の型に揃える。値は変えない）で
+包む同じ方式に統一**した（biz `127abef`／gh `3abba28`／fip `f2a50f9`）。デコレータは使わず（Gradioが関数のシグネチャ・
+docstringからMCPスキーマを作るため）、`return` 行だけを変更している。修正前後の出力は、gh 23条件・fip 33条件で完全一致。
+**本番のMCPをプロトコル層で確認**（`tools/call` の応答で、数値のはずの項目が文字列になっていないこと。`station_no` は本来文字列）:
+gh は4ツール・fip は8ツール全てで問題なし。**教訓の再掲**: MCPの戻り値は、ローカルの直接呼び出しやHTTPの`/call`では
+検出できない型の問題があるため、プロトコル層（`tools/call`）で確認する。
+
 ---
 
 ## 9. 決定事項・未確定事項
